@@ -52,6 +52,7 @@ SESSION_TIMEOUT_MIN = 30
 MAX_FAILED_ATTEMPTS = 5
 LOCK_MINUTES = 15
 PBKDF2_ITERATIONS = 200_000
+SCHEMA_VERSION = 2  # tăng khi đổi cấu trúc DB để nâng cấp chạy lại (init_once được cache)
 WARN_DAYS = 5  # cảnh báo "sắp đến hạn" khi còn <= số ngày này
 
 ROLES = {
@@ -554,8 +555,27 @@ def init_db():
             )
 
 
+def ensure_b6_columns(db):
+    cols = [r["name"] for r in db.execute("PRAGMA table_info(tasks)").fetchall()]
+    if "file_status" in cols and "pay_due_date" in cols:
+        return
+    for name, ddl in (
+        ("file_status", "ALTER TABLE tasks ADD COLUMN file_status TEXT DEFAULT 'Chưa nộp'"),
+        ("receipt_no", "ALTER TABLE tasks ADD COLUMN receipt_no TEXT DEFAULT ''"),
+        ("paid_date", "ALTER TABLE tasks ADD COLUMN paid_date TEXT DEFAULT ''"),
+        ("pay_due_date", "ALTER TABLE tasks ADD COLUMN pay_due_date TEXT DEFAULT ''"),
+    ):
+        if name not in cols:
+            db.execute(ddl)
+    db.execute(
+        "UPDATE tasks SET file_status='Đã nộp - chờ xác nhận' "
+        "WHERE step='B6' AND status IN ('Đã hoàn thành','Không phát sinh')"
+    )
+
+
 def fill_b6_defaults(db):
     """Hạn nộp tiền của QT TNDN / QT TNCN mặc định bằng hạn nộp hồ sơ (admin chỉnh được)."""
+    ensure_b6_columns(db)
     db.execute(
         "UPDATE tasks SET pay_due_date=due_date WHERE step='B6' "
         "AND tax_type IN ('TNDN','TNCN') AND COALESCE(pay_due_date,'')='' AND COALESCE(due_date,'')<>''"
@@ -575,7 +595,7 @@ def ensure_theme_config():
 
 
 @st.cache_resource
-def init_once():
+def init_once(schema_version=SCHEMA_VERSION):
     init_db()
     ensure_theme_config()
     return True
@@ -2449,7 +2469,7 @@ def main():
         page_title="NEW VISION - Quản lý công việc kế toán", page_icon=load_page_icon(), layout="wide"
     )
     st.markdown(CSS, unsafe_allow_html=True)
-    init_once()
+    init_once(SCHEMA_VERSION)
     user = current_user()
     if user is None:
         page_login()
