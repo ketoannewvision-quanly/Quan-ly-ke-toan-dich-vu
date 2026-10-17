@@ -66,8 +66,10 @@ STATUSES = [
     "Không phát sinh",
 ]
 DONE_STATUSES = ("Đã hoàn thành", "Không phát sinh")
-SELF_STATUSES = ["Chưa chỉnh sửa", "Đã chỉnh sửa"]
-REVIEW_STATUSES = ["Chưa sửa", "Đang sửa", "Đã sửa xong"]
+ISSUE_STATUSES = ["Chưa xử lý", "Đang xử lý", "Đã xử lý xong"]
+SELF_STATUSES = ISSUE_STATUSES
+REVIEW_STATUSES = ISSUE_STATUSES
+DONE_ISSUE_STATUSES = ("Đã xử lý xong", "Đã chỉnh sửa", "Đã sửa xong", "Đã hoàn thành")
 CHECK_STATUSES = ["Chưa kiểm tra", "Đã kiểm tra - đủ hồ sơ", "Thiếu hồ sơ - cần bổ sung"]
 
 STEPS = ["B1", "B2", "B3", "B4", "B5", "B6"]
@@ -179,6 +181,7 @@ CREATE TABLE IF NOT EXISTS issues (
     status TEXT NOT NULL,
     explanation TEXT DEFAULT '',
     handling_note TEXT DEFAULT '',
+    resolved_date TEXT DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT DEFAULT ''
 );
@@ -357,6 +360,13 @@ def init_db():
                     db.execute(ddl)
                 db.execute("DELETE FROM tasks WHERE step IN ('B4','B5')")
                 db.execute("DROP TABLE IF EXISTS b4_issues")
+        had_issues = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='issues'"
+        ).fetchone() is not None
+        if had_issues:
+            icols = [r["name"] for r in db.execute("PRAGMA table_info(issues)").fetchall()]
+            if "resolved_date" not in icols:
+                db.execute("ALTER TABLE issues ADD COLUMN resolved_date TEXT DEFAULT ''")
         count = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         if count == 0:
             pw = os.environ.get("ADMIN_INITIAL_PASSWORD", "Admin@123")
@@ -963,18 +973,20 @@ def completion_blocker(db, t):
     """Điều kiện để một việc B4/B5 được đánh dấu 'Đã hoàn thành'."""
     if t["step"] == "B4":
         n = db.execute(
-            "SELECT COUNT(*) FROM issues WHERE kind='self' AND client_id=? AND period=? AND status<>'Đã chỉnh sửa'",
+            "SELECT COUNT(*) FROM issues WHERE kind='self' AND client_id=? AND period=? "
+            "AND status NOT IN ('Đã xử lý xong', 'Đã chỉnh sửa', 'Đã hoàn thành')",
             (t["client_id"], t["period"]),
         ).fetchone()[0]
         if n:
-            return f"còn {n} vấn đề tự kiểm tra chưa chỉnh sửa."
+            return f"còn {n} vấn đề tự kiểm tra chưa được xử lý xong."
     if t["step"] == "B5":
         n = db.execute(
-            "SELECT COUNT(*) FROM issues WHERE kind='review' AND client_id=? AND period=? AND status<>'Đã sửa xong'",
+            "SELECT COUNT(*) FROM issues WHERE kind='review' AND client_id=? AND period=? "
+            "AND status NOT IN ('Đã xử lý xong', 'Đã sửa xong', 'Đã hoàn thành')",
             (t["client_id"], t["period"]),
         ).fetchone()[0]
         if n:
-            return f"còn {n} vấn đề soát xét chưa được sửa xong."
+            return f"còn {n} vấn đề soát xét chưa được xử lý xong."
         b4 = db.execute(
             "SELECT COUNT(*) FROM tasks WHERE client_id=? AND period=? AND step='B4' "
             "AND status NOT IN ('Đã hoàn thành','Không phát sinh')",
@@ -1129,8 +1141,8 @@ def render_step(user, step, sdf, period, client_ids, filt_key):
         "B1": "Người phụ trách tự điền **Ngày hoàn thành** khi xong từng bước hạch toán.",
         "B2": "Theo dõi từng sắc thuế và kỳ kê khai (tháng/quý/năm). Người phụ trách điền ngày hoàn thành.",
         "B3": "Nhập số thuế phát sinh và số đã nộp; hệ thống tự tính nộp thừa/(thiếu).",
-        "B4": "Người phụ trách tự kiểm tra, ghi vấn đề phát hiện và đánh dấu đã chỉnh sửa hay chưa.",
-        "B5": "Người kiểm tra ghi vấn đề và hướng xử lý; người phụ trách giải trình, sửa và cập nhật tình trạng.",
+        "B4": "Người phụ trách tự kiểm tra, ghi vấn đề phát hiện, hướng xử lý và theo dõi tình trạng, ngày hoàn thành.",
+        "B5": "Người kiểm tra ghi vấn đề và hướng xử lý; người phụ trách giải trình, xử lý và cập nhật ngày hoàn thành.",
         "B6": "Người phụ trách cập nhật việc lưu trữ; người kiểm tra cập nhật tình trạng kiểm tra hồ sơ.",
     }
     st.caption(captions[step])
@@ -1168,24 +1180,43 @@ def render_step(user, step, sdf, period, client_ids, filt_key):
 # ----------------------------------------------------------------------------
 ISSUE_COLS = [
     "id", "kind", "client_id", "period", "issue", "solution", "checker_id", "handler_id",
-    "status", "explanation", "handling_note", "created_at", "updated_at",
+    "status", "explanation", "handling_note", "resolved_date", "created_at", "updated_at",
     "client_code", "client_name",
 ]
+
+def normalize_issue_status(s):
+    s = str(s).strip() if s is not None else ""
+    if s in ("Đã chỉnh sửa", "Đã sửa xong", "Đã hoàn thành"):
+        return "Đã xử lý xong"
+    if s in ("Đang sửa", "Đang chỉnh sửa"):
+        return "Đang xử lý"
+    if s in ("Chưa chỉnh sửa", "Chưa sửa"):
+        return "Chưa xử lý"
+    return s if s in ISSUE_STATUSES else "Chưa xử lý"
+
 ISSUE_EDIT = {
-    ("self", "owner"): {"Vấn đề phát hiện", "Tình trạng chỉnh sửa", "Ghi chú chỉnh sửa", "Xóa"},
+    ("self", "owner"): {
+        "Vấn đề phát hiện", "Hướng xử lý", "Tình trạng xử lý", "Ngày hoàn thành", "Ghi chú xử lý", "Xóa"
+    },
     ("self", "admin"): {"Xóa"},
     ("review", "author"): {"Vấn đề phát hiện", "Hướng xử lý", "NV phụ trách", "Xóa"},
-    ("review", "handler"): {"Giải trình sai sót", "Tình trạng sửa", "Kết quả chỉnh sửa"},
+    ("review", "handler"): {
+        "Giải trình sai sót", "Tình trạng xử lý", "Ngày hoàn thành", "Kết quả xử lý"
+    },
     ("review", "admin"): {"NV phụ trách", "Xóa"},
 }
 
 
 def issue_order(kind):
     if kind == "self":
-        return ["ID", "Khách hàng", "Người tự kiểm tra", "Vấn đề phát hiện",
-                "Tình trạng chỉnh sửa", "Ghi chú chỉnh sửa", "Xóa"]
-    return ["ID", "Khách hàng", "Người kiểm tra", "Vấn đề phát hiện", "Hướng xử lý", "NV phụ trách",
-            "Giải trình sai sót", "Tình trạng sửa", "Kết quả chỉnh sửa", "Xóa"]
+        return [
+            "ID", "Khách hàng", "Người tự kiểm tra", "Vấn đề phát hiện", "Hướng xử lý",
+            "Tình trạng xử lý", "Ngày hoàn thành", "Ghi chú xử lý", "Xóa"
+        ]
+    return [
+        "ID", "Khách hàng", "Người kiểm tra", "Vấn đề phát hiện", "Hướng xử lý", "NV phụ trách",
+        "Giải trình sai sót", "Tình trạng xử lý", "Ngày hoàn thành", "Kết quả xử lý", "Xóa"
+    ]
 
 
 def load_issues(user, kind, period, client_ids):
@@ -1211,25 +1242,25 @@ def issue_view(df, kind, labels):
         "ID": df["id"].astype(int),
         "Khách hàng": df["client_code"] + " - " + df["client_name"],
         "Vấn đề phát hiện": df["issue"],
+        "Hướng xử lý": df["solution"].fillna(""),
+        "Tình trạng xử lý": df["status"].apply(normalize_issue_status),
+        "Ngày hoàn thành": date_series(df["resolved_date"]),
         "Xóa": False,
     }
     if kind == "self":
         base.update(
             {
                 "Người tự kiểm tra": df["checker_id"].map(labels).fillna(""),
-                "Tình trạng chỉnh sửa": df["status"],
-                "Ghi chú chỉnh sửa": df["handling_note"].fillna(""),
+                "Ghi chú xử lý": df["handling_note"].fillna(""),
             }
         )
     else:
         base.update(
             {
                 "Người kiểm tra": df["checker_id"].map(labels).fillna(""),
-                "Hướng xử lý": df["solution"].fillna(""),
                 "NV phụ trách": df["handler_id"].map(labels).fillna(""),
                 "Giải trình sai sót": df["explanation"].fillna(""),
-                "Tình trạng sửa": df["status"],
-                "Kết quả chỉnh sửa": df["handling_note"].fillna(""),
+                "Kết quả xử lý": df["handling_note"].fillna(""),
             }
         )
     return pd.DataFrame(base)
@@ -1239,14 +1270,17 @@ def issue_config(labels):
     cc = st.column_config
     return {
         "ID": cc.NumberColumn("ID", width="small"),
+        "Khách hàng": cc.TextColumn("Khách hàng"),
+        "Người tự kiểm tra": cc.TextColumn("Người tự kiểm tra"),
+        "Người kiểm tra": cc.TextColumn("Người kiểm tra"),
         "Vấn đề phát hiện": cc.TextColumn("Vấn đề phát hiện", max_chars=1000),
-        "Tình trạng chỉnh sửa": cc.SelectboxColumn("Tình trạng chỉnh sửa", options=SELF_STATUSES, required=True),
-        "Ghi chú chỉnh sửa": cc.TextColumn("Ghi chú chỉnh sửa", max_chars=1000),
         "Hướng xử lý": cc.TextColumn("Hướng xử lý", max_chars=1000),
         "NV phụ trách": cc.SelectboxColumn("NV phụ trách", options=[""] + list(labels.values()), required=False),
         "Giải trình sai sót": cc.TextColumn("Giải trình sai sót", max_chars=1000),
-        "Tình trạng sửa": cc.SelectboxColumn("Tình trạng sửa", options=REVIEW_STATUSES, required=True),
-        "Kết quả chỉnh sửa": cc.TextColumn("Kết quả chỉnh sửa", max_chars=1000),
+        "Tình trạng xử lý": cc.SelectboxColumn("Tình trạng xử lý", options=ISSUE_STATUSES, required=True),
+        "Ngày hoàn thành": cc.DateColumn("Ngày hoàn thành", format="DD/MM/YYYY"),
+        "Ghi chú xử lý": cc.TextColumn("Ghi chú xử lý", max_chars=1000),
+        "Kết quả xử lý": cc.TextColumn("Kết quả xử lý", max_chars=1000),
         "Xóa": cc.CheckboxColumn("Xóa"),
     }
 
@@ -1254,9 +1288,8 @@ def issue_config(labels):
 def save_issue_changes(user, kind, mode, original, edited, label_to_id):
     ok, errors = 0, []
     uid = user["id"]
-    status_col = "Tình trạng chỉnh sửa" if kind == "self" else "Tình trạng sửa"
-    note_col = "Ghi chú chỉnh sửa" if kind == "self" else "Kết quả chỉnh sửa"
-    valid_status = SELF_STATUSES if kind == "self" else REVIEW_STATUSES
+    note_col = "Ghi chú xử lý" if kind == "self" else "Kết quả xử lý"
+    valid_status = set(ISSUE_STATUSES) | {"Chưa chỉnh sửa", "Đã chỉnh sửa", "Chưa sửa", "Đang sửa", "Đã sửa xong"}
     with get_db() as db:
         for idx in original.index:
             o, e = original.loc[idx], edited.loc[idx]
@@ -1286,15 +1319,23 @@ def save_issue_changes(user, kind, mode, original, edited, label_to_id):
 
             if mode == "owner":
                 diff_text("Vấn đề phát hiện", "issue")
-                diff_text(status_col, "status")
+                diff_text("Hướng xử lý", "solution")
+                diff_text("Tình trạng xử lý", "status")
                 diff_text(note_col, "handling_note")
+                new_date = to_iso(e["Ngày hoàn thành"])
+                if new_date != to_iso(o["Ngày hoàn thành"]):
+                    changes["resolved_date"] = new_date
             elif mode == "author":
                 diff_text("Vấn đề phát hiện", "issue")
                 diff_text("Hướng xử lý", "solution")
             elif mode == "handler":
                 diff_text("Giải trình sai sót", "explanation")
-                diff_text(status_col, "status")
+                diff_text("Tình trạng xử lý", "status")
                 diff_text(note_col, "handling_note")
+                new_date = to_iso(e["Ngày hoàn thành"])
+                if new_date != to_iso(o["Ngày hoàn thành"]):
+                    changes["resolved_date"] = new_date
+
             if mode in ("author", "admin") and kind == "review":
                 nh, oh = clean_text(e["NV phụ trách"]), clean_text(o["NV phụ trách"])
                 if nh != oh:
@@ -1302,6 +1343,7 @@ def save_issue_changes(user, kind, mode, original, edited, label_to_id):
                         changes["handler_id"] = None
                     elif nh in label_to_id:
                         changes["handler_id"] = label_to_id[nh]
+
             if not changes:
                 continue
             if not perm:
@@ -1313,10 +1355,18 @@ def save_issue_changes(user, kind, mode, original, edited, label_to_id):
             if "status" in changes and changes["status"] not in valid_status:
                 errors.append(f"Vấn đề #{iid}: tình trạng không hợp lệ.")
                 continue
-            if kind == "review" and mode == "handler" and changes.get("status") == "Đã sửa xong":
+
+            # Tự động gán ngày hoàn thành nếu chuyển sang Đã xử lý xong mà chưa có ngày
+            st_val = changes.get("status", clean_text(row["status"]))
+            if st_val in DONE_ISSUE_STATUSES:
+                cur_date = changes.get("resolved_date", clean_text(row["resolved_date"]))
+                if not cur_date:
+                    changes["resolved_date"] = date.today().isoformat()
+
+            if kind == "review" and mode == "handler" and changes.get("status") in DONE_ISSUE_STATUSES:
                 expl = changes.get("explanation", clean_text(row["explanation"]))
                 if not expl:
-                    errors.append(f"Vấn đề #{iid}: vui lòng nhập giải trình sai sót trước khi chọn 'Đã sửa xong'.")
+                    errors.append(f"Vấn đề #{iid}: vui lòng nhập giải trình sai sót trước khi chọn 'Đã xử lý xong'.")
                     continue
             changes["updated_at"] = now_str()
             update_row(db, "issues", iid, changes)
@@ -1364,9 +1414,9 @@ def render_issues(user, period, client_ids, kind):
     uid = user["id"]
     step = "B4" if kind == "self" else "B5"
     if kind == "self":
-        st.markdown("#### Vấn đề tự kiểm tra và tình trạng chỉnh sửa")
+        st.markdown("#### Vấn đề tự kiểm tra, hướng xử lý và tình trạng hoàn thành")
     else:
-        st.markdown("#### Vấn đề soát xét cấp 2, giải trình và tình trạng sửa")
+        st.markdown("#### Vấn đề soát xét cấp 2, hướng xử lý, giải trình và tình trạng hoàn thành")
     labels = {u["id"]: user_label(u) for u in load_users()}
 
     # Chỉ người được phân công bước này (B4/B5) của khách hàng đó mới được thêm vấn đề
@@ -1379,18 +1429,24 @@ def render_issues(user, period, client_ids, kind):
                 (period, step, uid),
             ).fetchall()
         ]
+    if client_ids:
+        eligible = [c for c in eligible if c["id"] in client_ids]
     if eligible:
         title = "➕ Ghi nhận vấn đề tự kiểm tra" if kind == "self" else "➕ Ghi nhận vấn đề soát xét cấp 2"
         with st.expander(title):
-            with st.form(f"add_{kind}_{period}_{ver()}", clear_on_submit=True):
+            form_key_suffix = "_".join(map(str, client_ids)) if client_ids else "all"
+            with st.form(f"add_{kind}_{period}_{form_key_suffix}_{ver()}", clear_on_submit=True):
                 cmap = {c["id"]: c for c in eligible}
                 cid = st.selectbox("Khách hàng", list(cmap.keys()), format_func=lambda i: client_label(cmap[i]))
                 issue = st.text_area("Vấn đề phát hiện *")
+                solution = st.text_area("Hướng xử lý")
                 if kind == "self":
-                    note = st.text_area("Ghi chú chỉnh sửa (đã chỉnh sửa như thế nào)")
-                    solution, handler = "", 0
+                    note = st.text_area("Ghi chú xử lý (kết quả chỉnh sửa, nếu đã xử lý)")
+                    c_st1, c_st2 = st.columns(2)
+                    init_status = c_st1.selectbox("Tình trạng xử lý", ISSUE_STATUSES, index=0)
+                    init_date = c_st2.date_input("Ngày hoàn thành (nếu đã xử lý)", value=None)
+                    handler = 0
                 else:
-                    solution = st.text_area("Hướng xử lý")
                     umap = {u["id"]: u for u in load_users(active_only=True)}
                     handler = st.selectbox(
                         "Nhân viên phụ trách giải trình và sửa",
@@ -1398,22 +1454,30 @@ def render_issues(user, period, client_ids, kind):
                         format_func=lambda i: "Mặc định theo khách hàng" if i == 0 else user_label(umap[i]),
                     )
                     note = ""
+                    init_status = ISSUE_STATUSES[0]
+                    init_date = None
                 submitted = st.form_submit_button("Thêm vấn đề")
             if submitted:
                 if not issue.strip():
                     st.error("Vui lòng nhập vấn đề phát hiện.")
                 else:
                     if kind == "self":
-                        hid, status = uid, SELF_STATUSES[0]
+                        hid = uid
+                        status = init_status
+                        r_date = to_iso(init_date) if init_date else ""
+                        if status == "Đã xử lý xong" and not r_date:
+                            r_date = date.today().isoformat()
                     else:
-                        hid, status = (handler or cmap[cid]["staff_id"]), REVIEW_STATUSES[0]
+                        hid = (handler or cmap[cid]["staff_id"])
+                        status = init_status
+                        r_date = ""
                     with get_db() as db:
                         db.execute(
                             "INSERT INTO issues (kind, client_id, period, issue, solution, checker_id, "
-                            "handler_id, status, explanation, handling_note, created_at, updated_at) "
-                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            "handler_id, status, explanation, handling_note, resolved_date, created_at, updated_at) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (kind, cid, period, issue.strip(), solution.strip(), uid, hid, status,
-                             "", note.strip(), now_str(), now_str()),
+                             "", note.strip(), r_date, now_str(), now_str()),
                         )
                     log_action(user["username"], "THEM_VAN_DE", f"{kind} {cmap[cid]['code']} kỳ {period}")
                     flash("success", "Đã ghi nhận vấn đề.")
@@ -1592,13 +1656,148 @@ def page_dashboard(user):
 # ----------------------------------------------------------------------------
 # TRANG: CÔNG VIỆC HÀNG THÁNG
 # ----------------------------------------------------------------------------
+def render_tasks_by_client(user, df, period, client_ids, statuses, assignee_id, filt_key, cmap):
+    unique_cids = list(dict.fromkeys(df["client_id"]))
+    if not unique_cids:
+        st.info("Không có khách hàng nào trong bộ lọc hiện tại.")
+        return
+
+    client_stats = {}
+    for cid in unique_cids:
+        cdf = df[df["client_id"] == cid]
+        tot = len(cdf)
+        dn = int(cdf["status"].isin(DONE_STATUSES).sum())
+        pct = int(dn * 100 / tot) if tot else 0
+        late = sum(1 for d, s in zip(cdf["due_date"], cdf["status"]) if deadline_info(d, s)[1] == "late")
+        warn = sum(1 for d, s in zip(cdf["due_date"], cdf["status"]) if deadline_info(d, s)[1] == "warn")
+        client_stats[cid] = {
+            "tot": tot,
+            "dn": dn,
+            "pct": pct,
+            "late": late,
+            "warn": warn,
+        }
+
+    def client_opt_label(cid):
+        if cid == 0:
+            return f"📂 [Xem tất cả] Danh mục toàn bộ khách hàng ({len(unique_cids)} khách)"
+        c = cmap.get(cid, {})
+        stt = client_stats.get(cid, {})
+        code = c.get("code", str(cid))
+        name = c.get("name", "")
+        txt = f"{code} - {name} ({stt.get('dn', 0)}/{stt.get('tot', 0)} việc - {stt.get('pct', 0)}%)"
+        if stt.get("late", 0) > 0:
+            txt += f" ⚠️ {stt['late']} quá hạn"
+        return txt
+
+    opts = [0] + unique_cids
+    k = f"sel_client_view_{period}"
+    if k in st.session_state and st.session_state[k] not in opts:
+        st.session_state[k] = 0
+
+    c_sel, _ = st.columns([2.5, 1.5])
+    selected_cid = c_sel.selectbox(
+        "🔍 Chọn khách hàng:",
+        opts,
+        format_func=client_opt_label,
+        key=k,
+        help="Chọn từng khách hàng để xem chi tiết 6 bước hoặc chọn 'Xem tất cả' để xem bảng tổng hợp danh mục.",
+    )
+
+    if selected_cid != 0:
+        c = cmap.get(selected_cid, {})
+        cdf = df[df["client_id"] == selected_cid].reset_index(drop=True)
+        stt = client_stats.get(selected_cid, {})
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Tổng đầu việc", stt.get("tot", 0))
+        m2.metric("Đã hoàn thành", f"{stt.get('dn', 0)} ({stt.get('pct', 0)}%)")
+        late_cnt = stt.get("late", 0)
+        m3.metric("Quá hạn", late_cnt, delta=f"-{late_cnt}" if late_cnt > 0 else None, delta_color="inverse")
+        warn_cnt = stt.get("warn", 0)
+        m4.metric("Sắp đến hạn", warn_cnt)
+
+        st.progress(stt.get("dn", 0) / max(stt.get("tot", 1), 1))
+
+        info_left, info_right = st.columns(2)
+        info_left.markdown(
+            f"🏢 **Khách hàng:** `{c.get('code', '')}` - **{c.get('name', '')}**  \n"
+            f"🧾 **Mã số thuế:** {c.get('tax_code') or 'Chưa cập nhật'}"
+        )
+        info_right.markdown(
+            f"👤 **Nhân viên phụ trách:** {c.get('staff_name') or 'Chưa phân công'}  \n"
+            f"🔎 **Người kiểm tra:** {c.get('reviewer_name') or 'Chưa phân công'}"
+        )
+        st.divider()
+
+        step_tab_titles = []
+        for s in STEPS:
+            s_df = cdf[cdf["step"] == s]
+            s_done = int(s_df["status"].isin(DONE_STATUSES).sum())
+            s_tot = len(s_df)
+            step_tab_titles.append(f"{STEP_NAMES[s]} ({s_done}/{s_tot})")
+
+        c_tabs = st.tabs(step_tab_titles)
+        for tab, step in zip(c_tabs, STEPS):
+            with tab:
+                sdf = cdf[cdf["step"] == step].reset_index(drop=True)
+                render_step(user, step, sdf, period, [selected_cid], f"{filt_key}_c{selected_cid}")
+    else:
+        summary_rows = []
+        for cid in unique_cids:
+            c = cmap.get(cid, {})
+            stt = client_stats.get(cid, {})
+            summary_rows.append({
+                "Mã KH": c.get("code", str(cid)),
+                "Tên khách hàng": c.get("name", ""),
+                "MST": c.get("tax_code", "") or "—",
+                "NV phụ trách": c.get("staff_name") or "—",
+                "Người kiểm tra": c.get("reviewer_name") or "—",
+                "Tiến độ": f"{stt.get('pct', 0)}%",
+                "Đã xong / Tổng việc": f"{stt.get('dn', 0)} / {stt.get('tot', 0)}",
+                "Quá hạn": stt.get("late", 0),
+                "Sắp đến hạn": stt.get("warn", 0),
+            })
+        st.markdown("#### 📊 Bảng tổng hợp danh mục khách hàng trong kỳ")
+        full_width_call(st.dataframe, pd.DataFrame(summary_rows), hide_index=True)
+
+        st.markdown("#### 📁 Chi tiết công việc theo từng khách hàng")
+        for cid in unique_cids:
+            c = cmap.get(cid, {})
+            cdf = df[df["client_id"] == cid].reset_index(drop=True)
+            stt = client_stats.get(cid, {})
+            exp_title = f"🏢 {c.get('code', '')} - {c.get('name', '')}  |  Hoàn thành: {stt.get('dn', 0)}/{stt.get('tot', 0)} ({stt.get('pct', 0)}%)"
+            if stt.get("late", 0) > 0:
+                exp_title += f"  |  ⚠️ {stt['late']} việc quá hạn"
+
+            with st.expander(exp_title, expanded=False):
+                st.caption(
+                    f"MST: {c.get('tax_code') or 'Chưa có'} | "
+                    f"NV phụ trách: {c.get('staff_name') or 'Chưa phân công'} | "
+                    f"Người kiểm tra: {c.get('reviewer_name') or 'Chưa phân công'}"
+                )
+                step_tab_titles = []
+                for s in STEPS:
+                    s_df = cdf[cdf["step"] == s]
+                    s_done = int(s_df["status"].isin(DONE_STATUSES).sum())
+                    s_tot = len(s_df)
+                    step_tab_titles.append(f"{STEP_NAMES[s]} ({s_done}/{s_tot})")
+
+                c_tabs = st.tabs(step_tab_titles)
+                for tab, step in zip(c_tabs, STEPS):
+                    with tab:
+                        sdf = cdf[cdf["step"] == step].reset_index(drop=True)
+                        render_step(user, step, sdf, period, [cid], f"{filt_key}_c{cid}")
+
+
 def page_tasks(user):
     st.header("✅ Công việc kế toán dịch vụ hàng tháng")
     period = period_selector("tasks")
-    clients = load_clients(active_only=True)
+    clients = load_clients(active_only=False)
     cmap = {c["id"]: c for c in clients}
+    active_client_keys = [c["id"] for c in clients if c["active"]]
     f1, f2, f3 = st.columns(3)
-    client_ids = f1.multiselect("Khách hàng", list(cmap.keys()), format_func=lambda i: client_label(cmap[i]))
+    client_ids = f1.multiselect("Lọc khách hàng", active_client_keys, format_func=lambda i: client_label(cmap[i]))
     statuses = f2.multiselect("Trạng thái", STATUSES)
     assignee_id = 0
     if is_privileged(user):
@@ -1636,11 +1835,24 @@ def page_tasks(user):
         mime="text/csv",
     )
     filt_key = f"{period}_{'-'.join(map(str, client_ids))}_{'-'.join(statuses)}_{assignee_id}"
-    tabs = st.tabs([STEP_NAMES[s] for s in STEPS])
-    for tab, step in zip(tabs, STEPS):
-        with tab:
-            sdf = df[df["step"] == step].reset_index(drop=True)
-            render_step(user, step, sdf, period, client_ids, filt_key)
+
+    st.markdown("---")
+    v1, _ = st.columns([2, 1])
+    view_mode = v1.radio(
+        "Chế độ hiển thị công việc:",
+        ["🏢 Theo danh mục khách hàng", "📋 Theo bước quy trình (B1 - B6)"],
+        horizontal=True,
+        key="task_view_mode",
+    )
+
+    if view_mode == "🏢 Theo danh mục khách hàng":
+        render_tasks_by_client(user, df, period, client_ids, statuses, assignee_id, filt_key, cmap)
+    else:
+        tabs = st.tabs([STEP_NAMES[s] for s in STEPS])
+        for tab, step in zip(tabs, STEPS):
+            with tab:
+                sdf = df[df["step"] == step].reset_index(drop=True)
+                render_step(user, step, sdf, period, client_ids, filt_key)
 
 
 # ----------------------------------------------------------------------------
