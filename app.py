@@ -316,7 +316,7 @@ CSS = """
 .stApp h4 { font-size: 1.1rem; font-weight: 600; color: #1B8A4B; }
 .stMarkdown p { font-size: 1rem; line-height: 1.55; }
 
-[data-testid="stSidebar"] { background: linear-gradient(180deg, #0B3D20 0%, #14713A 100%); }
+[data-testid="stSidebar"] { background: linear-gradient(180deg, #17642F 0%, #26A05A 100%); }
 [data-testid="stSidebar"] p, [data-testid="stSidebar"] label, [data-testid="stSidebar"] span,
 [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3,
 [data-testid="stSidebar"] .stMarkdown, [data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
@@ -2691,7 +2691,7 @@ def main():
                 "<style>"
                 ".st-key-nav_group_1 { margin-left: 1cm !important; width: calc(100% - 1cm) !important; }"
                 ".st-key-nav_group_1 label { padding: 3px 6px !important; }"
-                ".st-key-nav_group_1 label p { font-size: 0.68rem !important; font-weight: 500 !important;"
+                ".st-key-nav_group_1 label p { font-size: 0.76rem !important; font-weight: 500 !important;"
                 " line-height: 1.3 !important; letter-spacing: 0.1px !important; white-space: normal !important; }"
                 "</style>",
                 unsafe_allow_html=True,
