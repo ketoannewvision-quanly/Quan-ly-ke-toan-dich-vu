@@ -2686,12 +2686,12 @@ def main():
             active = PARENT_LABEL if active in work_set else options[0]
 
         if shown_labels:
-            # Nhóm công ty: thụt vào 1cm (cả nút tròn lẫn tên), chữ nhỏ hơn mục CÔNG VIỆC HÀNG THÁNG
+            # Nhóm công ty: thụt vào 0,5cm (cả nút tròn lẫn tên), chữ nhỏ hơn mục CÔNG VIỆC HÀNG THÁNG
             st.markdown(
                 "<style>"
-                ".st-key-nav_group_1 { margin-left: 1cm !important; width: calc(100% - 1cm) !important; }"
+                ".st-key-nav_group_1 { margin-left: 0.5cm !important; width: calc(100% - 0.5cm) !important; }"
                 ".st-key-nav_group_1 label { padding: 3px 6px !important; }"
-                ".st-key-nav_group_1 label p { font-size: 0.76rem !important; font-weight: 500 !important;"
+                ".st-key-nav_group_1 label p { font-size: 0.84rem !important; font-weight: 500 !important;"
                 " line-height: 1.3 !important; letter-spacing: 0.1px !important; white-space: normal !important; }"
                 "</style>",
                 unsafe_allow_html=True,
