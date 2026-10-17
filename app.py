@@ -47,6 +47,7 @@ import streamlit as st
 # CẤU HÌNH
 # ----------------------------------------------------------------------------
 COMPANY = "NEW VISION"
+COMPANY_FULL = "CÔNG TY TNHH DỊCH VỤ TƯ VẤN NEW VISION"
 DB_PATH = os.environ.get("KETOAN_DB", "ketoan_dichvu.db")
 SESSION_TIMEOUT_MIN = 30
 MAX_FAILED_ATTEMPTS = 5
@@ -115,27 +116,45 @@ def _rgba(hex_color, alpha):
 
 
 def step_css():
-    """Sinh CSS màu cho các tab B1..B7 và dải tiêu đề từng bước (chỉ dùng hằng số trong mã nguồn)."""
-    out = [".nv-step { padding: 10px 16px; border-radius: 10px; margin: 2px 0 10px 0; font-weight: 700;"
-           " font-size: 1.1rem; border-left: 8px solid var(--sc); background: var(--sc-bg); color: var(--sc-dark); }"]
-    for i, step in enumerate(STEPS, start=1):
+    """CSS màu cho 7 nút bước B1..B7 và dải tiêu đề bước (chỉ dùng hằng số trong mã nguồn)."""
+    out = [
+        ".nv-step { padding: 10px 16px; border-radius: 10px; margin: 2px 0 10px 0; font-weight: 800;"
+        " font-size: 1.1rem; letter-spacing: 0.4px; border-left: 8px solid var(--sc);"
+        " background: var(--sc-bg); color: var(--sc-dark); }",
+        '[class*="st-key-stepbtn_"] button { width: 100%; min-height: 3.7rem; padding: 0.35rem 0.5rem;'
+        " border-radius: 12px !important; transition: all 0.15s ease-in-out; }",
+        '[class*="st-key-stepbtn_"] button p { white-space: normal; text-transform: uppercase;'
+        " font-weight: 800 !important; font-size: 0.8rem !important; line-height: 1.25 !important;"
+        " letter-spacing: 0.2px; }",
+    ]
+    for step in STEPS:
         main, light, dark = STEP_COLORS[step]
-        tab = f'.stTabs [data-baseweb="tab"]:nth-of-type({i})'
+        btn = f".st-key-stepbtn_{step} button"
         out.append(
-            f"{tab} {{ background: {light}; border: 2px solid {main}; border-top: 6px solid {main}; }}"
-            f"{tab} p {{ color: {dark}; font-weight: 700; }}"
-            f"{tab}:hover {{ background: {_rgba(main, 0.18)}; box-shadow: 0 5px 12px {_rgba(main, 0.35)}; }}"
-            f'{tab}[aria-selected="true"] {{ background: {main} !important; border-color: {dark} !important;'
-            f" box-shadow: 0 7px 18px {_rgba(main, 0.5)} !important; }}"
-            f'{tab}[aria-selected="true"] p {{ color: #FFFFFF !important; }}'
+            f"{btn} {{ background: {light} !important; border: 2px solid {main} !important;"
+            f" border-top: 7px solid {main} !important; }}"
+            f"{btn} p {{ color: {dark} !important; }}"
+            f"{btn}:hover {{ background: {_rgba(main, 0.2)} !important; transform: translateY(-2px);"
+            f" box-shadow: 0 6px 14px {_rgba(main, 0.4)} !important; }}"
         )
     return "\n".join(out)
+
+
+def step_active_css(step):
+    """Làm nổi bật nút của bước đang chọn: tô đặc bằng màu của bước đó."""
+    main, light, dark = STEP_COLORS[step]
+    btn = f".st-key-stepbtn_{step} button"
+    return (
+        f"<style>{btn}, {btn}:hover {{ background: {main} !important; border-color: {dark} !important;"
+        f" border-top-color: {dark} !important; box-shadow: 0 8px 20px {_rgba(main, 0.55)} !important;"
+        f" transform: translateY(-3px); }}{btn} p {{ color: #FFFFFF !important; }}</style>"
+    )
 
 
 def step_banner_html(step):
     main, light, dark = STEP_COLORS.get(step, ("#1B8A4B", "#E3F4E8", "#14713A"))
     return (f'<div class="nv-step" style="--sc:{main};--sc-bg:{light};--sc-dark:{dark}">'
-            f"{STEP_NAMES[step]}</div>")
+            f"{STEP_NAMES[step].upper()}</div>")
 
 
 B5_ITEM = "Soát xét hồ sơ kỳ"
@@ -301,6 +320,9 @@ CSS = """
 }
 [data-testid="stSidebar"] .stRadio label { padding: 6px 10px; border-radius: 8px; font-weight: 500; font-size: 0.95rem; }
 [data-testid="stSidebar"] .stRadio label:hover { background: rgba(255,255,255,0.16); }
+[data-testid="stSidebar"] .stRadio label p { text-transform: uppercase; letter-spacing: 0.3px; font-weight: 600; font-size: 0.88rem; }
+.nv-side-name { color: #0F5132; font-weight: 800; font-size: 0.8rem; letter-spacing: 0.4px; line-height: 1.35; text-transform: uppercase; margin-top: 6px; }
+.nv-step-bar { margin-top: 6px; }
 [data-testid="stSidebar"] .stTextInput input {
     background: rgba(255, 255, 255, 0.15);
     color: #FFFFFF !important;
@@ -396,14 +418,19 @@ ICON_B64 = (
 _LOGO_SRC = "data:image/jpeg;base64," + LOGO_B64
 HERO_HTML = (
     '<div class="nv-hero"><img src="' + _LOGO_SRC + '" alt="NEW VISION">'
-    '<div><div class="nv-title">Hệ thống quản lý công việc kế toán</div>'
-    '<div class="nv-sub"><b>Kế toán - Thuế - Tư vấn</b> &middot; Đồng hành cùng doanh nghiệp</div></div></div>'
+    '<div><div class="nv-title">' + COMPANY_FULL + '</div>'
+    '<div class="nv-sub"><b>Hệ thống quản lý công việc kế toán</b> &middot; Kế toán - Thuế - Tư vấn &middot; '
+    'Đồng hành cùng doanh nghiệp</div></div></div>'
 )
 LOGIN_HTML = (
     '<div class="nv-login"><img src="' + _LOGO_SRC + '" alt="NEW VISION">'
-    '<div class="nv-login-title">Hệ thống quản lý công việc kế toán</div></div>'
+    '<div class="nv-login-title">' + COMPANY_FULL + '</div>'
+    '<div class="nv-sub">Hệ thống quản lý công việc kế toán</div></div>'
 )
-SIDE_BRAND_HTML = '<div class="nv-side-brand"><img src="' + _LOGO_SRC + '" alt="NEW VISION"></div>'
+SIDE_BRAND_HTML = (
+    '<div class="nv-side-brand"><img src="' + _LOGO_SRC + '" alt="NEW VISION">'
+    '<div class="nv-side-name">' + COMPANY_FULL + '</div></div>'
+)
 
 
 def load_page_icon():
@@ -2200,11 +2227,17 @@ def page_tasks(user, selected_client_id=None):
         mime="text/csv",
     )
     filt_key = f"{period}_{'all' if all_mode else selected_client_id}_{len(client_ids)}_{'-'.join(statuses)}_{assignee_id}"
-    tabs = st.tabs([STEP_NAMES[s] for s in STEPS])
-    for tab, step in zip(tabs, STEPS):
-        with tab:
-            sdf = df[df["step"] == step].reset_index(drop=True)
-            render_step(user, step, sdf, period, client_ids, filt_key)
+    # Thanh chọn bước B1..B7: mỗi bước một màu, chữ in hoa; bước đang chọn được tô đặc
+    if st.session_state.get("active_step") not in STEPS:
+        st.session_state["active_step"] = STEPS[0]
+    step_cols = st.columns(len(STEPS))
+    for col, s in zip(step_cols, STEPS):
+        if col.button(STEP_NAMES[s].upper(), key=f"stepbtn_{s}"):
+            st.session_state["active_step"] = s
+    active_step = st.session_state["active_step"]
+    st.markdown(step_active_css(active_step), unsafe_allow_html=True)
+    sdf = df[df["step"] == active_step].reset_index(drop=True)
+    render_step(user, active_step, sdf, period, client_ids, filt_key)
 
 
 # ----------------------------------------------------------------------------
