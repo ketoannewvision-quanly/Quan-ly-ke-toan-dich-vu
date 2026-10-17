@@ -216,8 +216,18 @@ CSS = """
 [data-testid="stSidebar"] .stMarkdown, [data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
     color: #FFFFFF;
 }
-[data-testid="stSidebar"] .stRadio label { padding: 8px 12px; border-radius: 10px; font-weight: 500; }
-[data-testid="stSidebar"] .stRadio label:hover { background: rgba(255,255,255,0.14); }
+[data-testid="stSidebar"] .stRadio label { padding: 6px 10px; border-radius: 8px; font-weight: 500; font-size: 0.95rem; }
+[data-testid="stSidebar"] .stRadio label:hover { background: rgba(255,255,255,0.16); }
+[data-testid="stSidebar"] .stTextInput input {
+    background: rgba(255, 255, 255, 0.15);
+    color: #FFFFFF !important;
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    border-radius: 8px;
+    font-size: 0.9rem;
+}
+[data-testid="stSidebar"] .stTextInput input::placeholder {
+    color: rgba(255, 255, 255, 0.7);
+}
 [data-testid="stSidebar"] .stButton > button {
     width: 100%; background: rgba(255,255,255,0.14); color: #FFFFFF;
     border: 1px solid rgba(255,255,255,0.4);
@@ -1592,26 +1602,66 @@ def page_dashboard(user):
 # ----------------------------------------------------------------------------
 # TRANG: CÔNG VIỆC HÀNG THÁNG
 # ----------------------------------------------------------------------------
-def page_tasks(user):
-    st.header("✅ Công việc kế toán dịch vụ hàng tháng")
-    period = period_selector("tasks")
+def page_tasks(user, selected_client_id=None):
     clients = load_clients(active_only=True)
     cmap = {c["id"]: c for c in clients}
-    f1, f2, f3 = st.columns(3)
-    client_ids = f1.multiselect("Khách hàng", list(cmap.keys()), format_func=lambda i: client_label(cmap[i]))
-    statuses = f2.multiselect("Trạng thái", STATUSES)
-    assignee_id = 0
-    if is_privileged(user):
-        umap = {u["id"]: u for u in load_users(active_only=True)}
-        assignee_id = f3.selectbox(
-            "Người phụ trách",
-            [0] + list(umap.keys()),
-            format_func=lambda i: "Tất cả" if i == 0 else user_label(umap[i]),
-        )
+
+    if selected_client_id and selected_client_id in cmap:
+        sel_client = cmap[selected_client_id]
+
+        top_c1, top_c2 = st.columns([4, 1])
+        with top_c1:
+            st.header(f"🏢 {client_label(sel_client)}")
+        with top_c2:
+            if st.button("📋 Tất cả KH", help="Chuyển sang xem toàn bộ khách hàng"):
+                st.session_state["active_nav_choice"] = "\u00a0\u00a0├─ 📋 Tất cả khách hàng"
+                st.rerun()
+
+        info_items = []
+        if sel_client.get("tax_code"):
+            info_items.append(f"**MST:** `{sel_client['tax_code']}`")
+        if sel_client.get("staff_name"):
+            info_items.append(f"**Phụ trách:** {sel_client['staff_name']}")
+        if sel_client.get("reviewer_name"):
+            info_items.append(f"**Kiểm tra:** {sel_client['reviewer_name']}")
+        if info_items:
+            st.caption(" · ".join(info_items))
+
+        f1, f2 = st.columns([2, 1])
+        with f1:
+            period = period_selector("tasks")
+        with f2:
+            statuses = st.multiselect(
+                "Lọc trạng thái (tùy chọn)",
+                STATUSES,
+                key=f"status_filt_{selected_client_id}",
+            )
+
+        client_ids = [selected_client_id]
+        assignee_id = 0
+    else:
+        st.header("✅ Công việc kế toán dịch vụ hàng tháng")
+        period = period_selector("tasks")
+        f1, f2, f3 = st.columns(3)
+        client_ids = f1.multiselect("Khách hàng", list(cmap.keys()), format_func=lambda i: client_label(cmap[i]))
+        statuses = f2.multiselect("Trạng thái", STATUSES)
+        assignee_id = 0
+        if is_privileged(user):
+            umap = {u["id"]: u for u in load_users(active_only=True)}
+            assignee_id = f3.selectbox(
+                "Người phụ trách",
+                [0] + list(umap.keys()),
+                format_func=lambda i: "Tất cả" if i == 0 else user_label(umap[i]),
+            )
+
     df = load_tasks(user, period, client_ids, statuses, assignee_id)
     if df.empty:
-        st.info("Không có công việc phù hợp. Quản trị viên có thể sinh việc ở mục 'Sinh việc tự động'.")
+        if selected_client_id and selected_client_id in cmap:
+            st.info(f"Khách hàng **{cmap[selected_client_id]['code']}** chưa có công việc nào trong kỳ **{period_label(period)}**.")
+        else:
+            st.info("Không có công việc phù hợp. Quản trị viên có thể sinh việc ở mục 'Sinh việc tự động'.")
         return
+
     export = pd.DataFrame(
         {
             "Khách hàng": df["client_code"] + " - " + df["client_name"],
@@ -1629,10 +1679,11 @@ def page_tasks(user):
             "Ghi chú kiểm tra": df["check_note"],
         }
     )
+    csv_file = f"cong_viec_{cmap[selected_client_id]['code']}_{period}.csv" if (selected_client_id and selected_client_id in cmap) else f"cong_viec_{period}.csv"
     st.download_button(
         "⬇️ Xuất CSV (mở được bằng Excel)",
         data=export.to_csv(index=False).encode("utf-8-sig"),
-        file_name=f"cong_viec_{period}.csv",
+        file_name=csv_file,
         mime="text/csv",
     )
     filt_key = f"{period}_{'-'.join(map(str, client_ids))}_{'-'.join(statuses)}_{assignee_id}"
@@ -1989,17 +2040,7 @@ def main():
         auto_generate_recent(user["username"])
         st.session_state["auto_generated"] = True
 
-    menu = {
-        "📊 Tổng quan": page_dashboard,
-        "✅ Công việc hàng tháng": page_tasks,
-    }
-    if is_admin(user):
-        menu["🏢 Khách hàng"] = page_clients
-        menu["👥 Người dùng"] = page_users
-        menu["⚙️ Sinh việc tự động"] = page_generate
-        menu["📜 Nhật ký hệ thống"] = page_audit
-    menu["🔑 Đổi mật khẩu"] = lambda u: page_change_password(u)
-
+    clients = load_clients(active_only=True)
     alerts = alert_rows(user)
     n_late = sum(1 for r in alerts if deadline_info(r["due_date"], r["status"])[1] == "late")
     n_soon = len(alerts) - n_late
@@ -2010,7 +2051,55 @@ def main():
         st.caption(f"Vai trò: {ROLES[user['role']]}")
         if alerts:
             st.write(f"🔴 {n_late} trễ hạn · 🟠 {n_soon} sắp đến hạn (B2/B3)")
-        choice = st.radio("Chức năng", list(menu.keys()), label_visibility="collapsed")
+
+        # Tìm kiếm nhanh khách hàng nếu danh sách từ 6 khách hàng trở lên
+        filtered_clients = clients
+        if len(clients) >= 6:
+            c_kw = st.text_input(
+                "Tìm khách hàng",
+                value="",
+                placeholder="🔍 Tìm mã hoặc tên KH...",
+                key="sidebar_search_client",
+                label_visibility="collapsed",
+            ).strip().lower()
+            if c_kw:
+                filtered_clients = [c for c in clients if c_kw in c["code"].lower() or c_kw in c["name"].lower()]
+
+        menu_items = {}
+        menu_items["📊 Tổng quan"] = page_dashboard
+        menu_items["✅ Công việc hàng tháng"] = lambda u: page_tasks(u, None)
+        menu_items["\u00a0\u00a0├─ 📋 Tất cả khách hàng"] = lambda u: page_tasks(u, None)
+
+        for i, c in enumerate(filtered_clients):
+            is_last = (i == len(filtered_clients) - 1)
+            prefix = "\u00a0\u00a0└─ " if is_last else "\u00a0\u00a0├─ "
+            c_name = c["name"]
+            if len(c_name) > 28:
+                c_name = c_name[:26] + "…"
+            label = f"{prefix}🏢 {c['code']} - {c_name}"
+            cid = c["id"]
+            menu_items[label] = (lambda client_id=cid: lambda u: page_tasks(u, client_id))()
+
+        if is_admin(user):
+            menu_items["🏢 Khách hàng"] = page_clients
+            menu_items["👥 Người dùng"] = page_users
+            menu_items["⚙️ Sinh việc tự động"] = page_generate
+            menu_items["📜 Nhật ký hệ thống"] = page_audit
+        menu_items["🔑 Đổi mật khẩu"] = lambda u: page_change_password(u)
+
+        options = list(menu_items.keys())
+        prev_choice = st.session_state.get("active_nav_choice", options[0])
+        if prev_choice not in options:
+            prev_choice = options[1] if len(options) > 1 else options[0]
+
+        choice = st.radio(
+            "Chức năng",
+            options,
+            index=options.index(prev_choice),
+            label_visibility="collapsed",
+        )
+        st.session_state["active_nav_choice"] = choice
+
         st.divider()
         if st.button("Đăng xuất"):
             log_action(user["username"], "DANG_XUAT", "")
@@ -2020,7 +2109,7 @@ def main():
 
     st.markdown(HERO_HTML, unsafe_allow_html=True)
     show_flash()
-    menu[choice](user)
+    menu_items[choice](user)
 
 
 main()
