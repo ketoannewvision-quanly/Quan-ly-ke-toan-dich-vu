@@ -17,7 +17,8 @@ QUY TRÌNH HÀNG THÁNG
   B4. Tự kiểm tra: người phụ trách tự ghi vấn đề và đã chỉnh sửa hay chưa
   B5. Soát xét: người kiểm tra ghi vấn đề + hướng xử lý; người phụ trách giải trình,
       chỉnh sửa và cập nhật đã sửa xong hay chưa
-  B6. Lưu trữ hồ sơ: người phụ trách cập nhật; người kiểm tra cập nhật tình trạng kiểm tra
+  B6. Quyết toán cuối năm: theo dõi tình trạng nộp tờ khai và số tiền thuế nếu phát sinh (QT TNDN, QT TNCN, BCTC, TMBCTC)
+  B7. Lưu trữ hồ sơ: người phụ trách cập nhật; người kiểm tra cập nhật tình trạng kiểm tra
 
 NGUYÊN TẮC KHÓA Ô: ai được phân công thì người đó mới được điền; ô của người khác bị khóa.
 Quản trị viên chỉ phân công lại người phụ trách/người kiểm tra và chỉnh hạn.
@@ -70,14 +71,15 @@ SELF_STATUSES = ["Chưa chỉnh sửa", "Đã chỉnh sửa"]
 REVIEW_STATUSES = ["Chưa sửa", "Đang sửa", "Đã sửa xong"]
 CHECK_STATUSES = ["Chưa kiểm tra", "Đã kiểm tra - đủ hồ sơ", "Thiếu hồ sơ - cần bổ sung"]
 
-STEPS = ["B1", "B2", "B3", "B4", "B5", "B6"]
+STEPS = ["B1", "B2", "B3", "B4", "B5", "B6", "B7"]
 STEP_NAMES = {
     "B1": "B1. Hạch toán sổ sách",
     "B2": "B2. Kê khai thuế",
     "B3": "B3. Nộp tiền thuế",
     "B4": "B4. Tự kiểm tra",
     "B5": "B5. Soát xét",
-    "B6": "B6. Lưu trữ hồ sơ",
+    "B6": "B6. Quyết toán cuối năm",
+    "B7": "B7. Lưu trữ hồ sơ",
 }
 
 B1_ITEMS = [
@@ -93,7 +95,13 @@ B1_ITEMS = [
 ]
 B4_ITEM = "Tự kiểm tra hồ sơ kỳ"
 B5_ITEM = "Soát xét hồ sơ kỳ"
-B6_ITEM = "Lưu trữ hồ sơ kỳ"
+B6_ITEMS = [
+    ("QT TNDN", "TNDN"),
+    ("QT TNCN", "TNCN"),
+    ("BCTC", "BCTC"),
+    ("TMBCTC", "TMBCTC"),
+]
+B7_ITEM = "Lưu trữ hồ sơ kỳ"
 
 TAX_TYPES = [
     "GTGT", "TNCN", "TNDN", "Môn bài", "Thuế nhà thầu",
@@ -218,6 +226,21 @@ CSS = """
 }
 [data-testid="stSidebar"] .stRadio label { padding: 6px 10px; border-radius: 8px; font-weight: 500; font-size: 0.95rem; }
 [data-testid="stSidebar"] .stRadio label:hover { background: rgba(255,255,255,0.16); }
+[data-testid="stSidebar"] .stRadio div[role="radiogroup"] > label:has(input[value*=" - "]) {
+    margin-left: 24px !important;
+    width: calc(100% - 24px) !important;
+    font-size: 0.92rem;
+    border-left: 2px solid rgba(255, 255, 255, 0.25);
+    border-radius: 0 8px 8px 0;
+}
+[data-testid="stSidebar"] .stRadio div[role="radiogroup"] > label:has(input[value*=" - "]):hover {
+    border-left-color: #A3E635;
+    background: rgba(255, 255, 255, 0.18);
+}
+[data-testid="stSidebar"] .stRadio div[role="radiogroup"] > label:has(input[value*=" - "]:checked) {
+    border-left-color: #A3E635;
+    background: rgba(255, 255, 255, 0.22);
+}
 [data-testid="stSidebar"] .stTextInput input {
     background: rgba(255, 255, 255, 0.15);
     color: #FFFFFF !important;
@@ -352,6 +375,8 @@ def init_db():
             "SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'"
         ).fetchone() is not None
         db.executescript(SCHEMA)
+        # Nâng cấp các việc Lưu trữ hồ sơ từ B6 sang B7
+        db.execute("UPDATE tasks SET step='B7' WHERE step='B6' AND sub_item LIKE '%Lưu trữ%'")
         if had_tasks:
             cols = [r["name"] for r in db.execute("PRAGMA table_info(tasks)").fetchall()]
             if "completed_date" not in cols:
@@ -772,6 +797,10 @@ def due_date_for(step, tax_type, freq, y, m):
         return date(ny, nm, 15)
     if step == "B5":
         return date(ny, nm, 25)
+    if step == "B6":
+        return date(y + 1, 3, 31)
+    if step == "B7":
+        return date(ny, nm, last_day(ny, nm))
     return date(ny, nm, last_day(ny, nm))
 
 
@@ -800,7 +829,11 @@ def generate_tasks(year, month, actor):
                 rows.append(("B3", f"Nộp tiền thuế {t['tax_type']}", t["tax_type"], label, staff, None, due3))
             rows.append(("B4", B4_ITEM, "", "", staff, None, due_date_for("B4", "", "", year, month).isoformat()))
             rows.append(("B5", B5_ITEM, "", "", reviewer, None, due_date_for("B5", "", "", year, month).isoformat()))
-            rows.append(("B6", B6_ITEM, "", "", staff, reviewer, due_date_for("B6", "", "", year, month).isoformat()))
+            if month == 12:
+                d_qt = due_date_for("B6", "", "", year, month).isoformat()
+                for sub, ttype in B6_ITEMS:
+                    rows.append(("B6", sub, ttype, f"Năm {year}", staff, reviewer, d_qt))
+            rows.append(("B7", B7_ITEM, "", "", staff, reviewer, due_date_for("B7", "", "", year, month).isoformat()))
             for step, sub, tax, tperiod, assignee, checker, due in rows:
                 cur = db.execute(
                     "INSERT OR IGNORE INTO tasks (client_id, period, step, sub_item, tax_type, tax_period, "
@@ -820,6 +853,8 @@ def auto_generate_recent(actor):
     py, pm = add_month(today.year, today.month, -1)
     generate_tasks(py, pm, actor)
     generate_tasks(today.year, today.month, actor)
+    generate_tasks(today.year - 1, 12, actor)
+    generate_tasks(today.year, 12, actor)
 
 
 def sync_assignees(period, actor):
@@ -830,7 +865,7 @@ def sync_assignees(period, actor):
             "assignee_id = CASE WHEN step='B5' "
             "  THEN (SELECT reviewer_id FROM clients WHERE id=tasks.client_id) "
             "  ELSE (SELECT staff_id FROM clients WHERE id=tasks.client_id) END, "
-            "checker_id = CASE WHEN step='B6' "
+            "checker_id = CASE WHEN step IN ('B6','B7') "
             "  THEN (SELECT reviewer_id FROM clients WHERE id=tasks.client_id) ELSE checker_id END, "
             "updated_by=?, updated_at=? "
             "WHERE period=? AND status NOT IN ('Đã hoàn thành','Không phát sinh')",
@@ -842,7 +877,7 @@ def sync_assignees(period, actor):
 
 
 # ----------------------------------------------------------------------------
-# CÔNG VIỆC (B1 - B6): TRUY VẤN, BẢNG NHẬP, LƯU
+# CÔNG VIỆC (B1 - B7): TRUY VẤN, BẢNG NHẬP, LƯU
 # ----------------------------------------------------------------------------
 TASK_COLS = [
     "id", "client_id", "period", "step", "sub_item", "tax_type", "tax_period", "status",
@@ -909,42 +944,45 @@ def build_task_view(sdf, labels):
 
 def column_order(step, mode):
     base = ["ID", "Khách hàng", "Hạng mục"]
-    if step in ("B2", "B3"):
+    if step in ("B2", "B3", "B6"):
         base += ["Sắc thuế", "Kỳ kê khai"]
     if mode == "admin":
         order = base + ["Người phụ trách"]
-        if step == "B6":
+        if step in ("B6", "B7"):
             order += ["Người kiểm tra"]
         return order + ["Hạn", "Trạng thái"]
     if mode == "check":
         return ["ID", "Khách hàng", "Hạng mục", "Người phụ trách", "Trạng thái",
                 "Tình trạng kiểm tra", "Ghi chú kiểm tra"]
-    order = base + ["Người phụ trách", "Hạn"]
-    if step in ("B2", "B3"):
+    order = base + ["Người phụ trách"]
+    if step in ("B6", "B7"):
+        order += ["Người kiểm tra"]
+    order += ["Hạn"]
+    if step in ("B2", "B3", "B6"):
         order += ["Cảnh báo"]
-    if step in ("B1", "B2"):
+    if step in ("B1", "B2", "B6"):
         order += ["Ngày hoàn thành"]
-    if step == "B3":
+    if step in ("B3", "B6"):
         order += ["Số thuế phát sinh", "Số đã nộp", "Nộp thừa/(thiếu)", "Kết luận"]
     order += ["Trạng thái", "Ghi chú"]
-    if step == "B6":
-        order += ["Người kiểm tra", "Tình trạng kiểm tra", "Ghi chú kiểm tra"]
+    if step == "B7":
+        order += ["Tình trạng kiểm tra", "Ghi chú kiểm tra"]
     return order
 
 
 def editable_cols(step, mode):
     if mode == "work":
         s = {"Trạng thái", "Ghi chú"}
-        if step in ("B1", "B2"):
+        if step in ("B1", "B2", "B6"):
             s.add("Ngày hoàn thành")
-        if step == "B3":
+        if step in ("B3", "B6"):
             s |= {"Số thuế phát sinh", "Số đã nộp"}
         return s
     if mode == "check":
         return {"Tình trạng kiểm tra", "Ghi chú kiểm tra"}
     if mode == "admin":
         s = {"Người phụ trách", "Hạn"}
-        if step == "B6":
+        if step in ("B6", "B7"):
             s.add("Người kiểm tra")
         return s
     return set()
@@ -1012,11 +1050,11 @@ def save_task_changes(user, step, mode, original, edited, label_to_id):
                 new = clean_text(e["Ghi chú"])
                 if new != clean_text(o["Ghi chú"]):
                     changes["note"] = new
-                if step in ("B1", "B2"):
+                if step in ("B1", "B2", "B6"):
                     new = to_iso(e["Ngày hoàn thành"])
                     if new != to_iso(o["Ngày hoàn thành"]):
                         changes["completed_date"] = new
-                if step == "B3":
+                if step in ("B3", "B6"):
                     for col, field in (("Số thuế phát sinh", "tax_amount"), ("Số đã nộp", "paid_amount")):
                         nv, ov = to_num(e[col]), to_num(o[col])
                         if nv != ov:
@@ -1025,7 +1063,7 @@ def save_task_changes(user, step, mode, original, edited, label_to_id):
                                 changes = {}
                                 break
                             changes[field] = nv
-                allowed = t["assignee_id"] == user["id"]
+                allowed = t["assignee_id"] == user["id"] or (step in ("B6", "B7") and t["checker_id"] == user["id"])
             elif mode == "check":
                 new = clean_text(e["Tình trạng kiểm tra"])
                 if new != clean_text(o["Tình trạng kiểm tra"]):
@@ -1034,7 +1072,7 @@ def save_task_changes(user, step, mode, original, edited, label_to_id):
                 new = clean_text(e["Ghi chú kiểm tra"])
                 if new != clean_text(o["Ghi chú kiểm tra"]):
                     changes["check_note"] = new
-                allowed = step == "B6" and t["checker_id"] == user["id"]
+                allowed = step == "B7" and t["checker_id"] == user["id"]
             elif mode == "admin":
                 nl, ol = clean_text(e["Người phụ trách"]), clean_text(o["Người phụ trách"])
                 if nl != ol:
@@ -1042,7 +1080,7 @@ def save_task_changes(user, step, mode, original, edited, label_to_id):
                         changes["assignee_id"] = None
                     elif nl in label_to_id:
                         changes["assignee_id"] = label_to_id[nl]
-                if step == "B6":
+                if step in ("B6", "B7"):
                     nl, ol = clean_text(e["Người kiểm tra"]), clean_text(o["Người kiểm tra"])
                     if nl != ol:
                         if nl == "":
@@ -1127,13 +1165,37 @@ def b3_summary(sdf):
 def render_step(user, step, sdf, period, client_ids, filt_key):
     uid = user["id"]
     if sdf.empty:
-        st.info("Không có công việc nào ở bước này.")
+        if step == "B6":
+            st.info(f"Kỳ **{period_label(period)}** chưa có công việc Quyết toán cuối năm (thường được thực hiện ở kỳ Tháng 12 hàng năm).")
+            b1, b2 = st.columns([1, 2])
+            if b1.button(f"📅 Chuyển sang Tháng 12/{period[:4]}", key=f"btn_goto_dec_{filt_key}"):
+                st.session_state["period_tasks"] = f"{period[:4]}-12"
+                st.rerun()
+            if b2.button(f"➕ Tạo 4 mục Quyết toán cuối năm cho kỳ này", key=f"btn_gen_b6_{filt_key}"):
+                with get_db() as db:
+                    for cid in client_ids:
+                        c_info = db.execute("SELECT staff_id, reviewer_id FROM clients WHERE id=?", (cid,)).fetchone()
+                        s_id = c_info["staff_id"] if c_info else None
+                        r_id = c_info["reviewer_id"] if c_info else None
+                        d_qt = due_date_for("B6", "", "", int(period[:4]), int(period[5:7])).isoformat()
+                        for sub, ttype in B6_ITEMS:
+                            db.execute(
+                                "INSERT OR IGNORE INTO tasks (client_id, period, step, sub_item, tax_type, tax_period, "
+                                "status, assignee_id, checker_id, due_date, updated_by, updated_at) "
+                                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                                (cid, period, "B6", sub, ttype, f"Năm {period[:4]}", "Chưa thực hiện",
+                                 s_id, r_id, d_qt, user["username"], now_str()),
+                            )
+                flash("success", f"Đã tạo các mục Quyết toán cuối năm cho kỳ {period_label(period)}.")
+                st.rerun()
+        else:
+            st.info("Không có công việc nào ở bước này.")
     else:
         done = int(sdf["status"].isin(DONE_STATUSES).sum())
         st.progress(done / len(sdf), text=f"Hoàn thành {done}/{len(sdf)} việc")
-        if step in ("B2", "B3"):
+        if step in ("B2", "B3", "B6"):
             alert_banner(sdf)
-        if step == "B3":
+        if step in ("B3", "B6"):
             b3_summary(sdf)
     captions = {
         "B1": "Người phụ trách tự điền **Ngày hoàn thành** khi xong từng bước hạch toán.",
@@ -1141,7 +1203,8 @@ def render_step(user, step, sdf, period, client_ids, filt_key):
         "B3": "Nhập số thuế phát sinh và số đã nộp; hệ thống tự tính nộp thừa/(thiếu).",
         "B4": "Người phụ trách tự kiểm tra, ghi vấn đề phát hiện và đánh dấu đã chỉnh sửa hay chưa.",
         "B5": "Người kiểm tra ghi vấn đề và hướng xử lý; người phụ trách giải trình, sửa và cập nhật tình trạng.",
-        "B6": "Người phụ trách cập nhật việc lưu trữ; người kiểm tra cập nhật tình trạng kiểm tra hồ sơ.",
+        "B6": "Theo dõi tình trạng nộp tờ khai và số tiền thuế phát sinh (QT TNDN, QT TNCN, BCTC, TMBCTC).",
+        "B7": "Người phụ trách cập nhật việc lưu trữ; người kiểm tra cập nhật tình trạng kiểm tra hồ sơ.",
     }
     st.caption(captions[step])
 
@@ -1152,7 +1215,7 @@ def render_step(user, step, sdf, period, client_ids, filt_key):
             st.caption("Bạn không được phân công việc nào ở bước này.")
         else:
             task_grid(user, mine, step, "work", f"{step}_{filt_key}")
-        if step == "B6":
+        if step == "B7":
             checks = sdf[sdf["checker_id"] == uid]
             if not checks.empty:
                 st.markdown("**🔎 Kiểm tra lưu trữ (tôi là người kiểm tra)**")
@@ -1683,7 +1746,8 @@ def page_clients(user):
     st.header("🏢 Quản lý khách hàng")
     users = load_users(active_only=True)
     umap = {u["id"]: u for u in users}
-    reviewer_ids = [u["id"] for u in users if u["role"] in ("reviewer", "admin")]
+    # Toàn bộ danh sách người dùng được chọn làm người kiểm tra / soát xét
+    reviewer_ids = list(umap.keys())
 
     def ulabel(i):
         return "— Chưa chọn —" if i == 0 else user_label(umap[i])
@@ -1964,7 +2028,8 @@ def page_generate(user):
         f"- Cảnh báo **sắp đến hạn** khi còn từ 0 đến {WARN_DAYS} ngày; **trễ hạn** khi quá hạn mà chưa hoàn thành.\n"
         "- **B4 Tự kiểm tra** (nhân viên phụ trách), hạn ngày 15 tháng sau.\n"
         "- **B5 Soát xét** (người kiểm tra), hạn ngày 25 tháng sau.\n"
-        "- **B6 Lưu trữ hồ sơ** (nhân viên lưu trữ, người kiểm tra kiểm tra lại), hạn cuối tháng sau.\n"
+        "- **B6 Quyết toán cuối năm** (QT TNDN, QT TNCN, BCTC, TMBCTC), hạn ngày 31/03 năm sau.\n"
+        "- **B7 Lưu trữ hồ sơ** (nhân viên lưu trữ, người kiểm tra kiểm tra lại), hạn cuối tháng sau.\n"
         "- Hạn và người phụ trách có thể được quản trị viên chỉnh trực tiếp ở mục Công việc."
     )
 
@@ -2057,8 +2122,8 @@ def main():
             c_name = c["name"]
             if len(c_name) > 30:
                 c_name = c_name[:28] + "…"
-            # Thụt đầu dòng, không dùng ký hiệu ├─ hay icon 🏢
-            label = f"\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0{c['code']} - {c_name}"
+            # Nhãn dạng: [Mã KH] - [Tên KH] (Ký hiệu tròn và toàn bộ dòng được thụt lề bằng CSS)
+            label = f"{c['code']} - {c_name}"
             cid = c["id"]
 
             def make_handler(client_id):
