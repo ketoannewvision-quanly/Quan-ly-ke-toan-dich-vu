@@ -17,7 +17,9 @@ QUY TRÌNH HÀNG THÁNG
   B4. Tự kiểm tra: người phụ trách tự ghi vấn đề và đã chỉnh sửa hay chưa
   B5. Soát xét: người kiểm tra ghi vấn đề + hướng xử lý; người phụ trách giải trình,
       chỉnh sửa và cập nhật đã sửa xong hay chưa
-  B6. Quyết toán cuối năm: theo dõi tình trạng nộp tờ khai và số tiền thuế nếu phát sinh (QT TNDN, QT TNCN, BCTC, TMBCTC)
+  B6. Quyết toán cuối năm (QT TNDN, QT TNCN, BCTC, TMBCTC), theo dõi tách làm 2 phần:
+        A. Nộp hồ sơ: hạn, tình trạng nộp, ngày nộp, số tiếp nhận (cả 4 hồ sơ)
+        B. Nộp tiền thuế: số phát sinh, đã nộp, ngày nộp, thừa/thiếu, hạn nộp tiền (QT TNDN, QT TNCN)
   B7. Lưu trữ hồ sơ: người phụ trách cập nhật; người kiểm tra cập nhật tình trạng kiểm tra
 
 NGUYÊN TẮC KHÓA Ô: ai được phân công thì người đó mới được điền; ô của người khác bị khóa.
@@ -73,13 +75,13 @@ CHECK_STATUSES = ["Chưa kiểm tra", "Đã kiểm tra - đủ hồ sơ", "Thi�
 
 STEPS = ["B1", "B2", "B3", "B4", "B5", "B6", "B7"]
 STEP_NAMES = {
-    "B1": "B1. Hạch toán sổ sách",
-    "B2": "B2. Kê khai thuế",
-    "B3": "B3. Nộp tiền thuế",
-    "B4": "B4. Tự kiểm tra",
-    "B5": "B5. Soát xét",
-    "B6": "B6. Quyết toán cuối năm",
-    "B7": "B7. Lưu trữ hồ sơ",
+    "B1": "📝 B1. Hạch toán sổ sách",
+    "B2": "📑 B2. Kê khai thuế",
+    "B3": "💰 B3. Nộp tiền thuế",
+    "B4": "🔍 B4. Tự kiểm tra",
+    "B5": "🛡️ B5. Soát xét",
+    "B6": "📊 B6. Quyết toán cuối năm",
+    "B7": "📁 B7. Lưu trữ hồ sơ",
 }
 
 B1_ITEMS = [
@@ -102,6 +104,15 @@ B6_ITEMS = [
     ("TMBCTC", "TMBCTC"),
 ]
 B7_ITEM = "Lưu trữ hồ sơ kỳ"
+# B6: tình trạng nộp hồ sơ quyết toán; chỉ QT TNDN và QT TNCN có phát sinh tiền thuế phải nộp
+FILE_STATUSES = [
+    "Chưa nộp",
+    "Đã nộp - chờ xác nhận",
+    "Cơ quan thuế đã chấp nhận",
+    "Bị từ chối - cần nộp lại",
+]
+FILED_OK = ("Đã nộp - chờ xác nhận", "Cơ quan thuế đã chấp nhận")
+B6_PAYABLE = ("TNDN", "TNCN")
 
 TAX_TYPES = [
     "GTGT", "TNCN", "TNDN", "Môn bài", "Thuế nhà thầu",
@@ -173,6 +184,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     note TEXT DEFAULT '',
     updated_by TEXT DEFAULT '',
     updated_at TEXT DEFAULT '',
+    file_status TEXT DEFAULT 'Chưa nộp',
+    receipt_no TEXT DEFAULT '',
+    paid_date TEXT DEFAULT '',
+    pay_due_date TEXT DEFAULT '',
     UNIQUE (client_id, period, step, sub_item, tax_type, tax_period)
 );
 CREATE TABLE IF NOT EXISTS issues (
@@ -226,21 +241,6 @@ CSS = """
 }
 [data-testid="stSidebar"] .stRadio label { padding: 6px 10px; border-radius: 8px; font-weight: 500; font-size: 0.95rem; }
 [data-testid="stSidebar"] .stRadio label:hover { background: rgba(255,255,255,0.16); }
-[data-testid="stSidebar"] .stRadio div[role="radiogroup"] > label:has(input[value*=" - "]) {
-    margin-left: 24px !important;
-    width: calc(100% - 24px) !important;
-    font-size: 0.92rem;
-    border-left: 2px solid rgba(255, 255, 255, 0.25);
-    border-radius: 0 8px 8px 0;
-}
-[data-testid="stSidebar"] .stRadio div[role="radiogroup"] > label:has(input[value*=" - "]):hover {
-    border-left-color: #A3E635;
-    background: rgba(255, 255, 255, 0.18);
-}
-[data-testid="stSidebar"] .stRadio div[role="radiogroup"] > label:has(input[value*=" - "]:checked) {
-    border-left-color: #A3E635;
-    background: rgba(255, 255, 255, 0.22);
-}
 [data-testid="stSidebar"] .stTextInput input {
     background: rgba(255, 255, 255, 0.15);
     color: #FFFFFF !important;
@@ -274,12 +274,147 @@ CSS = """
 [data-testid="stMetricLabel"] p { color: #4B6355; font-weight: 500; }
 [data-testid="stMetricValue"] { color: #0B3D20; font-weight: 700; }
 
-.stTabs [data-baseweb="tab-list"] { gap: 6px; border-bottom: 2px solid #CFE8D8; }
-.stTabs [data-baseweb="tab"] {
-    font-weight: 600; color: #14713A; padding: 10px 16px; border-radius: 10px 10px 0 0;
+.stTabs [data-baseweb="tab-list"] {
+    gap: 8px;
+    border-bottom: 2px solid #D1D5DB;
+    padding-bottom: 2px;
 }
-.stTabs [aria-selected="true"] { background: #E3F4E8; color: #0B3D20; }
-.stTabs [data-baseweb="tab-highlight"] { background-color: #1B8A4B; }
+.stTabs [data-baseweb="tab"] {
+    font-weight: 600;
+    padding: 10px 16px;
+    border-radius: 10px 10px 0 0;
+    border: 2px solid transparent;
+    border-bottom: none;
+    transition: all 0.2s ease-in-out;
+}
+.stTabs [data-baseweb="tab"]:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.08);
+}
+.stTabs [data-baseweb="tab"][aria-selected="true"] {
+    transform: translateY(-3px);
+    font-weight: 700;
+}
+.stTabs [data-baseweb="tab"][aria-selected="true"] p,
+.stTabs [data-baseweb="tab"][aria-selected="true"] span,
+.stTabs [data-baseweb="tab"][aria-selected="true"] div {
+    color: #FFFFFF !important;
+}
+.stTabs [data-baseweb="tab-highlight"] {
+    display: none;
+}
+
+/* B1: Xanh dương (Blue) */
+.stTabs [data-baseweb="tab"]:nth-of-type(1) {
+    background: #EFF6FF;
+    border-color: #BFDBFE;
+}
+.stTabs [data-baseweb="tab"]:nth-of-type(1) p { color: #1D4ED8; }
+.stTabs [data-baseweb="tab"]:nth-of-type(1):hover {
+    background: #DBEAFE;
+    border-color: #3B82F6;
+}
+.stTabs [data-baseweb="tab"]:nth-of-type(1)[aria-selected="true"] {
+    background: #2563EB !important;
+    border-color: #1D4ED8 !important;
+    box-shadow: 0 5px 14px rgba(37, 99, 235, 0.4) !important;
+}
+
+/* B2: Xanh ngọc (Teal) */
+.stTabs [data-baseweb="tab"]:nth-of-type(2) {
+    background: #F0FDFA;
+    border-color: #99F6E4;
+}
+.stTabs [data-baseweb="tab"]:nth-of-type(2) p { color: #0F766E; }
+.stTabs [data-baseweb="tab"]:nth-of-type(2):hover {
+    background: #CCFBF1;
+    border-color: #14B8A6;
+}
+.stTabs [data-baseweb="tab"]:nth-of-type(2)[aria-selected="true"] {
+    background: #0D9488 !important;
+    border-color: #0F766E !important;
+    box-shadow: 0 5px 14px rgba(13, 148, 136, 0.4) !important;
+}
+
+/* B3: Vàng hổ phách (Amber / Gold) */
+.stTabs [data-baseweb="tab"]:nth-of-type(3) {
+    background: #FFFBEB;
+    border-color: #FDE68A;
+}
+.stTabs [data-baseweb="tab"]:nth-of-type(3) p { color: #B45309; }
+.stTabs [data-baseweb="tab"]:nth-of-type(3):hover {
+    background: #FEF3C7;
+    border-color: #F59E0B;
+}
+.stTabs [data-baseweb="tab"]:nth-of-type(3)[aria-selected="true"] {
+    background: #D97706 !important;
+    border-color: #B45309 !important;
+    box-shadow: 0 5px 14px rgba(217, 119, 6, 0.4) !important;
+}
+
+/* B4: Cam san hô (Orange / Coral) */
+.stTabs [data-baseweb="tab"]:nth-of-type(4) {
+    background: #FFF7ED;
+    border-color: #FED7AA;
+}
+.stTabs [data-baseweb="tab"]:nth-of-type(4) p { color: #C2410C; }
+.stTabs [data-baseweb="tab"]:nth-of-type(4):hover {
+    background: #FFEDD5;
+    border-color: #F97316;
+}
+.stTabs [data-baseweb="tab"]:nth-of-type(4)[aria-selected="true"] {
+    background: #EA580C !important;
+    border-color: #C2410C !important;
+    box-shadow: 0 5px 14px rgba(234, 88, 12, 0.4) !important;
+}
+
+/* B5: Tím tử đinh hương (Violet / Purple) */
+.stTabs [data-baseweb="tab"]:nth-of-type(5) {
+    background: #F5F3FF;
+    border-color: #DDD6FE;
+}
+.stTabs [data-baseweb="tab"]:nth-of-type(5) p { color: #6D28D9; }
+.stTabs [data-baseweb="tab"]:nth-of-type(5):hover {
+    background: #EDE9FE;
+    border-color: #8B5CF6;
+}
+.stTabs [data-baseweb="tab"]:nth-of-type(5)[aria-selected="true"] {
+    background: #7C3AED !important;
+    border-color: #6D28D9 !important;
+    box-shadow: 0 5px 14px rgba(124, 58, 237, 0.4) !important;
+}
+
+/* B6: Đỏ hồng Ruby (Rose / Ruby) */
+.stTabs [data-baseweb="tab"]:nth-of-type(6) {
+    background: #FFF1F2;
+    border-color: #FECDD3;
+}
+.stTabs [data-baseweb="tab"]:nth-of-type(6) p { color: #BE123C; }
+.stTabs [data-baseweb="tab"]:nth-of-type(6):hover {
+    background: #FFE4E6;
+    border-color: #F43F5E;
+}
+.stTabs [data-baseweb="tab"]:nth-of-type(6)[aria-selected="true"] {
+    background: #E11D48 !important;
+    border-color: #BE123C !important;
+    box-shadow: 0 5px 14px rgba(225, 29, 72, 0.4) !important;
+}
+
+/* B7: Xanh lục bảo (Emerald / Forest Green) */
+.stTabs [data-baseweb="tab"]:nth-of-type(7) {
+    background: #ECFDF5;
+    border-color: #A7F3D0;
+}
+.stTabs [data-baseweb="tab"]:nth-of-type(7) p { color: #047857; }
+.stTabs [data-baseweb="tab"]:nth-of-type(7):hover {
+    background: #D1FAE5;
+    border-color: #10B981;
+}
+.stTabs [data-baseweb="tab"]:nth-of-type(7)[aria-selected="true"] {
+    background: #059669 !important;
+    border-color: #047857 !important;
+    box-shadow: 0 5px 14px rgba(5, 150, 105, 0.4) !important;
+}
 
 [data-testid="stExpander"] { background: #FFFFFF; border: 1px solid #CFE8D8; border-radius: 12px; }
 [data-testid="stForm"] { background: #FFFFFF; border: 1px solid #CFE8D8; border-radius: 14px; padding: 1rem; }
@@ -392,6 +527,22 @@ def init_db():
                     db.execute(ddl)
                 db.execute("DELETE FROM tasks WHERE step IN ('B4','B5')")
                 db.execute("DROP TABLE IF EXISTS b4_issues")
+        # Nâng cấp B6: thêm cột theo dõi nộp hồ sơ / nộp tiền
+        cols = [r["name"] for r in db.execute("PRAGMA table_info(tasks)").fetchall()]
+        if "file_status" not in cols:
+            for ddl in (
+                "ALTER TABLE tasks ADD COLUMN file_status TEXT DEFAULT 'Chưa nộp'",
+                "ALTER TABLE tasks ADD COLUMN receipt_no TEXT DEFAULT ''",
+                "ALTER TABLE tasks ADD COLUMN paid_date TEXT DEFAULT ''",
+                "ALTER TABLE tasks ADD COLUMN pay_due_date TEXT DEFAULT ''",
+            ):
+                db.execute(ddl)
+            # Việc B6 đã hoàn thành trước đây: coi như hồ sơ đã nộp
+            db.execute(
+                "UPDATE tasks SET file_status='Đã nộp - chờ xác nhận' "
+                "WHERE step='B6' AND status IN ('Đã hoàn thành','Không phát sinh')"
+            )
+        fill_b6_defaults(db)
         count = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         if count == 0:
             pw = os.environ.get("ADMIN_INITIAL_PASSWORD", "Admin@123")
@@ -401,6 +552,14 @@ def init_db():
                 "active, must_change_pw, created_at) VALUES (?,?,?,?,?,?,?,?)",
                 ("admin", "Quản trị viên", h, s, "admin", 1, 1, now_str()),
             )
+
+
+def fill_b6_defaults(db):
+    """Hạn nộp tiền của QT TNDN / QT TNCN mặc định bằng hạn nộp hồ sơ (admin chỉnh được)."""
+    db.execute(
+        "UPDATE tasks SET pay_due_date=due_date WHERE step='B6' "
+        "AND tax_type IN ('TNDN','TNCN') AND COALESCE(pay_due_date,'')='' AND COALESCE(due_date,'')<>''"
+    )
 
 
 def ensure_theme_config():
@@ -700,6 +859,40 @@ def settlement(amount, paid):
     return d, f"Nộp thiếu {fmt_vnd(-d)}"
 
 
+def pay_status(amount, paid, payable=True):
+    """Tình trạng nộp tiền thuế quyết toán. Trả về (nội dung, mức: done/partial/pending/unknown/na)."""
+    if not payable:
+        return "Không áp dụng", "na"
+    a, p = to_num(amount), to_num(paid)
+    if a is None:
+        return "Chưa nhập số thuế phát sinh", "unknown"
+    p0 = p or 0.0
+    if a == 0 and p0 == 0:
+        return "Không phát sinh thuế", "done"
+    if p0 == 0:
+        return "Chưa nộp tiền", "pending"
+    if p0 < a:
+        return f"Nộp một phần (còn thiếu {fmt_vnd(a - p0)})", "partial"
+    if p0 == a:
+        return "Đã nộp đủ", "done"
+    return f"Nộp thừa {fmt_vnd(p0 - a)}", "done"
+
+
+def is_filed(file_status, status):
+    return clean_text(file_status) in FILED_OK or clean_text(status) == "Không phát sinh"
+
+
+def file_warning(due, file_status, status):
+    return deadline_info(due, "Đã hoàn thành" if is_filed(file_status, status) else "Chưa thực hiện")
+
+
+def pay_warning(pay_due, amount, paid, payable):
+    if not payable:
+        return "—", "none"
+    _, lvl = pay_status(amount, paid, True)
+    return deadline_info(pay_due, "Đã hoàn thành" if lvl == "done" else "Chưa thực hiện")
+
+
 def alert_rows(user):
     limit = (date.today() + timedelta(days=WARN_DAYS)).isoformat()
     sql = (
@@ -843,6 +1036,7 @@ def generate_tasks(year, month, actor):
                      assignee, checker, due, actor, now_str()),
                 )
                 inserted += cur.rowcount
+        fill_b6_defaults(db)
     if inserted:
         log_action(actor, "SINH_VIEC", f"Kỳ {period}: thêm {inserted} đầu việc")
     return inserted
@@ -883,6 +1077,7 @@ TASK_COLS = [
     "id", "client_id", "period", "step", "sub_item", "tax_type", "tax_period", "status",
     "assignee_id", "checker_id", "due_date", "completed_date", "tax_amount", "paid_amount",
     "check_status", "check_note", "note", "updated_by", "updated_at", "client_code", "client_name",
+    "file_status", "receipt_no", "paid_date", "pay_due_date",
 ]
 
 
@@ -918,6 +1113,21 @@ def build_task_view(sdf, labels):
         d, c = settlement(a, p)
         diffs.append(d)
         concl.append(c)
+    file_status = sdf["file_status"].fillna("").replace("", "Chưa nộp")
+    warn, pay_txt, pay_warn = [], [], []
+    for step, ttype, due, st_, fs, a, p, pdue in zip(
+        sdf["step"], sdf["tax_type"], sdf["due_date"], sdf["status"], file_status,
+        amt, paid, sdf["pay_due_date"],
+    ):
+        if step == "B6":
+            warn.append(file_warning(due, fs, st_)[0])
+            payable = ttype in B6_PAYABLE
+            pay_txt.append(pay_status(a, p, payable)[0])
+            pay_warn.append(pay_warning(pdue, a, p, payable)[0])
+        else:
+            warn.append(deadline_info(due, st_)[0])
+            pay_txt.append("")
+            pay_warn.append("")
     return pd.DataFrame(
         {
             "ID": sdf["id"].astype(int),
@@ -928,8 +1138,15 @@ def build_task_view(sdf, labels):
             "Người phụ trách": sdf["assignee_id"].map(labels).fillna(""),
             "Người kiểm tra": sdf["checker_id"].map(labels).fillna(""),
             "Hạn": date_series(sdf["due_date"]),
-            "Cảnh báo": [deadline_info(d, s)[0] for d, s in zip(sdf["due_date"], sdf["status"])],
+            "Cảnh báo": warn,
             "Ngày hoàn thành": date_series(sdf["completed_date"]),
+            "Tình trạng hồ sơ": file_status,
+            "Ngày nộp hồ sơ": date_series(sdf["completed_date"]),
+            "Số tiếp nhận": sdf["receipt_no"].fillna(""),
+            "Hạn nộp tiền": date_series(sdf["pay_due_date"]),
+            "Ngày nộp tiền": date_series(sdf["paid_date"]),
+            "Tình trạng nộp tiền": pay_txt,
+            "Cảnh báo nộp tiền": pay_warn,
             "Số thuế phát sinh": amt,
             "Số đã nộp": paid,
             "Nộp thừa/(thiếu)": diffs,
@@ -942,7 +1159,24 @@ def build_task_view(sdf, labels):
     )
 
 
+def b6_column_order(mode):
+    head = ["ID", "Khách hàng", "Hạng mục"]
+    if mode == "b6file":
+        return head + ["Người phụ trách", "Người kiểm tra", "Hạn", "Cảnh báo", "Tình trạng hồ sơ",
+                       "Ngày nộp hồ sơ", "Số tiếp nhận", "Trạng thái", "Ghi chú"]
+    if mode == "b6pay":
+        return head + ["Hạn nộp tiền", "Cảnh báo nộp tiền", "Số thuế phát sinh", "Số đã nộp",
+                       "Ngày nộp tiền", "Nộp thừa/(thiếu)", "Tình trạng nộp tiền"]
+    if mode == "admin":
+        return head + ["Người phụ trách", "Người kiểm tra", "Hạn", "Hạn nộp tiền", "Trạng thái"]
+    return head + ["Người phụ trách", "Người kiểm tra", "Hạn", "Tình trạng hồ sơ", "Ngày nộp hồ sơ", "Cảnh báo",
+                   "Số thuế phát sinh", "Số đã nộp", "Nộp thừa/(thiếu)", "Tình trạng nộp tiền",
+                   "Hạn nộp tiền", "Ngày nộp tiền", "Trạng thái", "Ghi chú"]
+
+
 def column_order(step, mode):
+    if step == "B6":
+        return b6_column_order(mode)
     base = ["ID", "Khách hàng", "Hạng mục"]
     if step in ("B2", "B3", "B6"):
         base += ["Sắc thuế", "Kỳ kê khai"]
@@ -971,6 +1205,12 @@ def column_order(step, mode):
 
 
 def editable_cols(step, mode):
+    if step == "B6":
+        return {
+            "b6file": {"Tình trạng hồ sơ", "Ngày nộp hồ sơ", "Số tiếp nhận", "Trạng thái", "Ghi chú"},
+            "b6pay": {"Số thuế phát sinh", "Số đã nộp", "Ngày nộp tiền"},
+            "admin": {"Người phụ trách", "Người kiểm tra", "Hạn", "Hạn nộp tiền"},
+        }.get(mode, set())
     if mode == "work":
         s = {"Trạng thái", "Ghi chú"}
         if step in ("B1", "B2", "B6"):
@@ -997,6 +1237,13 @@ def task_column_config(labels):
         "Người kiểm tra": cc.SelectboxColumn("Người kiểm tra", options=opts, required=False),
         "Hạn": cc.DateColumn("Hạn", format="DD/MM/YYYY"),
         "Ngày hoàn thành": cc.DateColumn("Ngày hoàn thành", format="DD/MM/YYYY"),
+        "Tình trạng hồ sơ": cc.SelectboxColumn("Tình trạng hồ sơ", options=FILE_STATUSES, required=True),
+        "Ngày nộp hồ sơ": cc.DateColumn("Ngày nộp hồ sơ", format="DD/MM/YYYY"),
+        "Số tiếp nhận": cc.TextColumn("Số tiếp nhận / mã giao dịch", max_chars=100),
+        "Hạn nộp tiền": cc.DateColumn("Hạn nộp tiền", format="DD/MM/YYYY"),
+        "Ngày nộp tiền": cc.DateColumn("Ngày nộp tiền", format="DD/MM/YYYY"),
+        "Tình trạng nộp tiền": cc.TextColumn("Tình trạng nộp tiền"),
+        "Cảnh báo nộp tiền": cc.TextColumn("Cảnh báo nộp tiền"),
         "Số thuế phát sinh": cc.NumberColumn("Số thuế phát sinh (VNĐ)", min_value=0, format="%.0f"),
         "Số đã nộp": cc.NumberColumn("Số đã nộp (VNĐ)", min_value=0, format="%.0f"),
         "Nộp thừa/(thiếu)": cc.NumberColumn("Nộp thừa/(thiếu) (VNĐ)", format="%.0f"),
@@ -1007,8 +1254,17 @@ def task_column_config(labels):
     }
 
 
-def completion_blocker(db, t):
-    """Điều kiện để một việc B4/B5 được đánh dấu 'Đã hoàn thành'."""
+def completion_blocker(db, t, changes=None):
+    """Điều kiện để một việc B4/B5/B6 được đánh dấu 'Đã hoàn thành'."""
+    if t["step"] == "B6":
+        eff = dict(t)
+        eff.update(changes or {})
+        if clean_text(eff.get("file_status")) not in FILED_OK:
+            return "hồ sơ chưa được nộp (cập nhật 'Tình trạng hồ sơ')."
+        if eff["tax_type"] in B6_PAYABLE:
+            text, lvl = pay_status(eff["tax_amount"], eff["paid_amount"], True)
+            if lvl != "done":
+                return f"nghĩa vụ nộp tiền thuế chưa hoàn tất ({text})."
     if t["step"] == "B4":
         n = db.execute(
             "SELECT COUNT(*) FROM issues WHERE kind='self' AND client_id=? AND period=? AND status<>'Đã chỉnh sửa'",
@@ -1064,6 +1320,41 @@ def save_task_changes(user, step, mode, original, edited, label_to_id):
                                 break
                             changes[field] = nv
                 allowed = t["assignee_id"] == user["id"] or (step in ("B6", "B7") and t["checker_id"] == user["id"])
+            elif mode == "b6file":
+                new = clean_text(e["Tình trạng hồ sơ"])
+                if new != clean_text(o["Tình trạng hồ sơ"]):
+                    if new in FILE_STATUSES:
+                        changes["file_status"] = new
+                    else:
+                        errors.append(f"Việc #{tid}: tình trạng hồ sơ không hợp lệ.")
+                new = to_iso(e["Ngày nộp hồ sơ"])
+                if new != to_iso(o["Ngày nộp hồ sơ"]):
+                    changes["completed_date"] = new
+                new = clean_text(e["Số tiếp nhận"])
+                if new != clean_text(o["Số tiếp nhận"]):
+                    changes["receipt_no"] = new
+                new = clean_text(e["Trạng thái"])
+                if new != clean_text(o["Trạng thái"]):
+                    changes["status"] = new
+                new = clean_text(e["Ghi chú"])
+                if new != clean_text(o["Ghi chú"]):
+                    changes["note"] = new
+                allowed = t["assignee_id"] == user["id"] or t["checker_id"] == user["id"]
+            elif mode == "b6pay":
+                if t["tax_type"] not in B6_PAYABLE:
+                    continue
+                for col, field in (("Số thuế phát sinh", "tax_amount"), ("Số đã nộp", "paid_amount")):
+                    nv, ov = to_num(e[col]), to_num(o[col])
+                    if nv != ov:
+                        if nv is not None and nv < 0:
+                            errors.append(f"Việc #{tid}: {col} không được âm.")
+                            changes = {}
+                            break
+                        changes[field] = nv
+                new = to_iso(e["Ngày nộp tiền"])
+                if changes != {} and new != to_iso(o["Ngày nộp tiền"]):
+                    changes["paid_date"] = new
+                allowed = t["assignee_id"] == user["id"] or t["checker_id"] == user["id"]
             elif mode == "check":
                 new = clean_text(e["Tình trạng kiểm tra"])
                 if new != clean_text(o["Tình trạng kiểm tra"]):
@@ -1090,6 +1381,10 @@ def save_task_changes(user, step, mode, original, edited, label_to_id):
                 nd, od = to_iso(e["Hạn"]), to_iso(o["Hạn"])
                 if nd != od:
                     changes["due_date"] = nd
+                if step == "B6" and t["tax_type"] in B6_PAYABLE:
+                    nd, od = to_iso(e["Hạn nộp tiền"]), to_iso(o["Hạn nộp tiền"])
+                    if nd != od:
+                        changes["pay_due_date"] = nd
                 allowed = is_admin(user)
             else:
                 continue
@@ -1103,10 +1398,20 @@ def save_task_changes(user, step, mode, original, edited, label_to_id):
                     errors.append(f"Việc #{tid}: trạng thái không hợp lệ.")
                     continue
                 if changes["status"] == "Đã hoàn thành":
-                    blocker = completion_blocker(db, t)
+                    blocker = completion_blocker(db, t, changes)
                     if blocker:
-                        errors.append(f"Việc #{tid} ({STEP_NAMES[step]}): chưa thể hoàn thành vì {blocker}")
-                        continue
+                        if step == "B6":
+                            # B6: vẫn lưu các thông tin khác, chỉ không đổi trạng thái sang Đã hoàn thành
+                            errors.append(
+                                f"Việc #{tid} ({t['sub_item']}): chưa thể chuyển sang Đã hoàn thành vì {blocker.rstrip('.')} "
+                                "(các thông tin khác đã được lưu)."
+                            )
+                            changes.pop("status")
+                            if not changes:
+                                continue
+                        else:
+                            errors.append(f"Việc #{tid} ({STEP_NAMES[step]}): chưa thể hoàn thành vì {blocker}")
+                            continue
             changes["updated_by"] = user["username"]
             changes["updated_at"] = now_str()
             update_row(db, "tasks", tid, changes)
@@ -1138,7 +1443,8 @@ def task_grid(user, df, step, mode, key):
         column_config=cfg,
     )
     caption = {"work": "💾 Lưu cập nhật công việc", "check": "💾 Lưu kết quả kiểm tra",
-               "admin": "💾 Lưu phân công"}[mode]
+               "admin": "💾 Lưu phân công", "b6file": "💾 Lưu tình trạng nộp hồ sơ",
+               "b6pay": "💾 Lưu tình trạng nộp tiền"}[mode]
     if st.button(caption, key=f"save_{key}_{mode}_{ver()}"):
         ok, errors = save_task_changes(user, step, mode, view, edited, label_to_id)
         if errors:
@@ -1160,6 +1466,76 @@ def b3_summary(sdf):
     c2.metric("Tổng đã nộp", fmt_vnd(paid.sum()))
     c3.metric("Nộp thừa", fmt_vnd(diff[diff > 0].sum()))
     c4.metric("Nộp thiếu", fmt_vnd(-diff[diff < 0].sum()))
+
+
+def render_b6(user, sdf, period, client_ids, filt_key):
+    """B6 Quyết toán cuối năm: tách theo dõi (A) nộp hồ sơ và (B) nộp tiền thuế."""
+    uid = user["id"]
+    total = len(sdf)
+    filed_flags = [is_filed(fs, s) for fs, s in zip(sdf["file_status"], sdf["status"])]
+    n_filed = sum(filed_flags)
+    pay = sdf[sdf["tax_type"].isin(B6_PAYABLE)]
+    amt = pd.to_numeric(pay["tax_amount"], errors="coerce").fillna(0.0)
+    paid = pd.to_numeric(pay["paid_amount"], errors="coerce").fillna(0.0)
+    n_pay_done = sum(
+        pay_status(a, p, True)[1] == "done" for a, p in zip(pay["tax_amount"], pay["paid_amount"])
+    )
+
+    st.caption(
+        f"Quyết toán năm **{period[:4]}**. Theo dõi riêng **(A) nộp hồ sơ** của cả 4 hồ sơ "
+        "và **(B) nộp tiền thuế** của QT TNDN, QT TNCN. BCTC và TMBCTC không phát sinh tiền thuế phải nộp."
+    )
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Hồ sơ đã nộp", f"{n_filed}/{total}")
+    c2.metric("Khoản thuế đã nộp xong", f"{n_pay_done}/{len(pay)}")
+    c3.metric("Thuế QT phát sinh", fmt_vnd(amt.sum()))
+    c4.metric("Đã nộp", fmt_vnd(paid.sum()))
+    short = (amt - paid).clip(lower=0).sum()
+    over = (paid - amt).clip(lower=0).sum()
+    c5.metric("Còn thiếu", fmt_vnd(short), delta=f"Nộp thừa {fmt_vnd(over)}" if over else None, delta_color="off")
+    st.progress(n_filed / total, text=f"Đã nộp hồ sơ {n_filed}/{total}")
+
+    late = soon = 0
+    for row in sdf.itertuples():
+        lv = file_warning(row.due_date, row.file_status, row.status)[1]
+        late += lv == "late"
+        soon += lv == "soon"
+        if row.tax_type in B6_PAYABLE:
+            lv = pay_warning(row.pay_due_date, row.tax_amount, row.paid_amount, True)[1]
+            late += lv == "late"
+            soon += lv == "soon"
+    if late:
+        st.error(f"🔴 Có {late} nghĩa vụ (nộp hồ sơ hoặc nộp tiền) đã trễ hạn.")
+    if soon:
+        st.warning(f"🟠 Có {soon} nghĩa vụ sắp đến hạn (trong {WARN_DAYS} ngày tới).")
+    if not late and not soon:
+        st.success("🟢 Không có nghĩa vụ trễ hạn hoặc sắp đến hạn.")
+
+    mine = sdf[(sdf["assignee_id"] == uid) | (sdf["checker_id"] == uid)]
+    st.markdown("### 📄 A. Nộp hồ sơ (tờ khai quyết toán, BCTC, TMBCTC)")
+    if mine.empty:
+        st.caption("Bạn không được phân công việc nào ở bước này.")
+    else:
+        st.caption("Cập nhật **Tình trạng hồ sơ**, **Ngày nộp hồ sơ** và **Số tiếp nhận / mã giao dịch** khi nộp.")
+        task_grid(user, mine, "B6", "b6file", f"B6_{filt_key}")
+    st.markdown("### 💰 B. Nộp tiền thuế (QT TNDN, QT TNCN)")
+    mine_pay = mine[mine["tax_type"].isin(B6_PAYABLE)]
+    if mine_pay.empty:
+        st.caption("Bạn không được phân công khoản nộp tiền thuế nào.")
+    else:
+        st.caption("Nhập **Số thuế phát sinh** (nhập 0 nếu không phát sinh), **Số đã nộp** và **Ngày nộp tiền**; "
+                   "hệ thống tự tính nộp thừa/(thiếu) và tình trạng.")
+        task_grid(user, mine_pay, "B6", "b6pay", f"B6_{filt_key}")
+    st.caption("Chỉ đánh dấu **Đã hoàn thành** được khi hồ sơ đã nộp và (với QT TNDN, QT TNCN) tiền thuế đã nộp xong hoặc không phát sinh.")
+
+    if is_privileged(user):
+        others = sdf[(sdf["assignee_id"] != uid) & (sdf["checker_id"] != uid)]
+        if not others.empty:
+            with st.expander("👁️ Việc của người khác (chỉ xem, ô bị khóa)"):
+                task_grid(user, others, "B6", "readonly", f"B6_{filt_key}")
+    if is_admin(user):
+        with st.expander("🛠️ Quản trị: phân công người phụ trách, chỉnh hạn nộp hồ sơ và hạn nộp tiền"):
+            task_grid(user, sdf, "B6", "admin", f"B6_{filt_key}")
 
 
 def render_step(user, step, sdf, period, client_ids, filt_key):
@@ -1186,11 +1562,16 @@ def render_step(user, step, sdf, period, client_ids, filt_key):
                                 (cid, period, "B6", sub, ttype, f"Năm {period[:4]}", "Chưa thực hiện",
                                  s_id, r_id, d_qt, user["username"], now_str()),
                             )
+                with get_db() as db:
+                    fill_b6_defaults(db)
                 flash("success", f"Đã tạo các mục Quyết toán cuối năm cho kỳ {period_label(period)}.")
                 st.rerun()
         else:
             st.info("Không có công việc nào ở bước này.")
     else:
+        if step == "B6":
+            render_b6(user, sdf, period, client_ids, filt_key)
+            return
         done = int(sdf["status"].isin(DONE_STATUSES).sum())
         st.progress(done / len(sdf), text=f"Hoàn thành {done}/{len(sdf)} việc")
         if step in ("B2", "B3", "B6"):
@@ -1677,7 +2058,7 @@ def page_tasks(user, selected_client_id=None):
         selected_client_id = clients[0]["id"]
 
     sel_client = cmap[selected_client_id]
-    st.header(client_label(sel_client))
+    st.header(sel_client["name"])
 
     info_items = []
     if sel_client.get("tax_code"):
@@ -1718,6 +2099,10 @@ def page_tasks(user, selected_client_id=None):
             "Ngày hoàn thành": df["completed_date"],
             "Số thuế phát sinh": df["tax_amount"],
             "Số đã nộp": df["paid_amount"],
+            "Tình trạng hồ sơ (B6)": df["file_status"],
+            "Số tiếp nhận (B6)": df["receipt_no"],
+            "Hạn nộp tiền (B6)": df["pay_due_date"],
+            "Ngày nộp tiền (B6)": df["paid_date"],
             "Trạng thái": df["status"],
             "Ghi chú": df["note"],
             "Tình trạng kiểm tra lưu trữ": df["check_status"],
@@ -2105,12 +2490,15 @@ def main():
             c_kw = st.text_input(
                 "Tìm khách hàng",
                 value="",
-                placeholder="🔍 Tìm mã hoặc tên KH...",
+                placeholder="🔍 Tìm tên hoặc MST khách hàng...",
                 key="sidebar_search_client",
                 label_visibility="collapsed",
             ).strip().lower()
             if c_kw:
-                filtered_clients = [c for c in clients if c_kw in c["code"].lower() or c_kw in c["name"].lower()]
+                filtered_clients = [
+                    c for c in clients
+                    if c_kw in c["name"].lower() or c_kw in (c["tax_code"] or "").lower()
+                ]
 
         menu_items = {}
         menu_items["📊 Tổng quan"] = page_dashboard
@@ -2120,10 +2508,12 @@ def main():
 
         for c in filtered_clients:
             c_name = c["name"]
-            if len(c_name) > 30:
-                c_name = c_name[:28] + "…"
-            # Nhãn dạng: [Mã KH] - [Tên KH] (Ký hiệu tròn và toàn bộ dòng được thụt lề bằng CSS)
-            label = f"{c['code']} - {c_name}"
+            if len(c_name) > 32:
+                c_name = c_name[:30] + "…"
+            # Nhãn chỉ gồm tên khách hàng; thụt lề phân cấp được thêm bằng CSS bên dưới
+            label = c_name
+            if label in menu_items:  # trùng tên: phân biệt bằng MST (hoặc số thứ tự)
+                label = f"{c_name} ({c['tax_code'] or c['id']})"
             cid = c["id"]
 
             def make_handler(client_id):
@@ -2142,6 +2532,24 @@ def main():
         menu_items["🔑 Đổi mật khẩu"] = lambda u: page_change_password(u)
 
         options = list(menu_items.keys())
+        if filtered_clients:
+            # Các khách hàng nằm ngay sau 2 mục đầu (Tổng quan, Công việc hàng tháng): thụt vào dưới "Công việc hàng tháng"
+            last = 2 + len(filtered_clients)
+            st.markdown(
+                "<style>"
+                '[data-testid="stSidebar"] .stRadio div[role="radiogroup"] > '
+                f"label:nth-child(n+3):nth-child(-n+{last}) {{"
+                "margin-left: 28px !important; width: calc(100% - 28px) !important; font-size: 0.92rem;"
+                "border-left: 2px solid rgba(255,255,255,0.25); border-radius: 0 8px 8px 0; }"
+                '[data-testid="stSidebar"] .stRadio div[role="radiogroup"] > '
+                f"label:nth-child(n+3):nth-child(-n+{last}):hover {{"
+                "border-left-color: #A3E635; background: rgba(255,255,255,0.18); }"
+                '[data-testid="stSidebar"] .stRadio div[role="radiogroup"] > '
+                f"label:nth-child(n+3):nth-child(-n+{last}):has(input:checked) {{"
+                "border-left-color: #A3E635; background: rgba(255,255,255,0.22); }"
+                "</style>",
+                unsafe_allow_html=True,
+            )
         prev_choice = st.session_state.get("active_nav_choice", options[0])
         if prev_choice not in options:
             prev_choice = options[1] if len(options) > 1 else options[0]
