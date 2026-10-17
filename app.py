@@ -316,7 +316,7 @@ CSS = """
 .stApp h4 { font-size: 1.1rem; font-weight: 600; color: #1B8A4B; }
 .stMarkdown p { font-size: 1rem; line-height: 1.55; }
 
-[data-testid="stSidebar"] { background: linear-gradient(180deg, #17642F 0%, #26A05A 100%); }
+[data-testid="stSidebar"] { background: linear-gradient(180deg, #04230F 0%, #0A4A24 100%); }
 [data-testid="stSidebar"] p, [data-testid="stSidebar"] label, [data-testid="stSidebar"] span,
 [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3,
 [data-testid="stSidebar"] .stMarkdown, [data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
