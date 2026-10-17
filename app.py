@@ -512,7 +512,23 @@ def init_db():
         ).fetchone() is not None
         db.executescript(SCHEMA)
         # Nâng cấp các việc Lưu trữ hồ sơ từ B6 sang B7
-        db.execute("UPDATE tasks SET step='B7' WHERE step='B6' AND sub_item LIKE '%Lưu trữ%'")
+        db.execute("UPDATE OR IGNORE tasks SET step='B7' WHERE step='B6' AND sub_item LIKE '%Lưu trữ%'")
+        # Dòng B6 "Lưu trữ" còn sót (đã có dòng B7 trùng khóa): gộp dữ liệu sang B7 rồi xóa
+        for r in db.execute(
+            "SELECT * FROM tasks WHERE step='B6' AND sub_item LIKE '%Lưu trữ%'"
+        ).fetchall():
+            b7 = db.execute(
+                "SELECT id, status FROM tasks WHERE client_id=? AND period=? AND step='B7' "
+                "AND sub_item=? AND tax_type=? AND tax_period=?",
+                (r["client_id"], r["period"], r["sub_item"], r["tax_type"], r["tax_period"]),
+            ).fetchone()
+            if b7 is not None and b7["status"] == "Chưa thực hiện" and r["status"] != "Chưa thực hiện":
+                db.execute(
+                    "UPDATE tasks SET status=?, completed_date=?, note=?, check_status=?, check_note=? WHERE id=?",
+                    (r["status"], r["completed_date"] or "", r["note"] or "",
+                     r["check_status"] or "Chưa kiểm tra", r["check_note"] or "", b7["id"]),
+                )
+            db.execute("DELETE FROM tasks WHERE id=?", (r["id"],))
         if had_tasks:
             cols = [r["name"] for r in db.execute("PRAGMA table_info(tasks)").fetchall()]
             if "completed_date" not in cols:
