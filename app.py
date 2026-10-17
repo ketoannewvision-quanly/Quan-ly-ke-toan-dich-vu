@@ -1167,7 +1167,7 @@ def build_task_view(sdf, labels):
     return pd.DataFrame(
         {
             "ID": sdf["id"].astype(int),
-            "Khách hàng": sdf["client_code"] + " - " + sdf["client_name"],
+            "Khách hàng": sdf["client_name"],
             "Hạng mục": sdf["sub_item"],
             "Sắc thuế": sdf["tax_type"],
             "Kỳ kê khai": sdf["tax_period"],
@@ -2090,21 +2090,33 @@ def page_tasks(user, selected_client_id=None):
         return
 
     cmap = {c["id"]: c for c in clients}
-    if not selected_client_id or selected_client_id not in cmap:
-        selected_client_id = clients[0]["id"]
+    # Không chọn khách hàng cụ thể (mục "Công việc hàng tháng"): xem toàn bộ khách hàng
+    all_mode = not selected_client_id or selected_client_id not in cmap
+    if all_mode:
+        sel_client = None
+        selected_client_id = "all"
+        st.header("✅ Công việc hàng tháng - tất cả khách hàng")
+        picked = st.multiselect(
+            "Lọc khách hàng (để trống = xem tất cả)",
+            list(cmap.keys()),
+            format_func=lambda i: cmap[i]["name"],
+            key="all_clients_filter",
+        )
+        client_ids = picked or list(cmap.keys())
+    else:
+        sel_client = cmap[selected_client_id]
+        st.header(sel_client["name"])
+        client_ids = [selected_client_id]
 
-    sel_client = cmap[selected_client_id]
-    st.header(sel_client["name"])
-
-    info_items = []
-    if sel_client.get("tax_code"):
-        info_items.append(f"**MST:** `{sel_client['tax_code']}`")
-    if sel_client.get("staff_name"):
-        info_items.append(f"**Phụ trách:** {sel_client['staff_name']}")
-    if sel_client.get("reviewer_name"):
-        info_items.append(f"**Kiểm tra:** {sel_client['reviewer_name']}")
-    if info_items:
-        st.caption(" · ".join(info_items))
+        info_items = []
+        if sel_client.get("tax_code"):
+            info_items.append(f"**MST:** `{sel_client['tax_code']}`")
+        if sel_client.get("staff_name"):
+            info_items.append(f"**Phụ trách:** {sel_client['staff_name']}")
+        if sel_client.get("reviewer_name"):
+            info_items.append(f"**Kiểm tra:** {sel_client['reviewer_name']}")
+        if info_items:
+            st.caption(" · ".join(info_items))
 
     f1, f2 = st.columns([2, 1])
     with f1:
@@ -2116,17 +2128,17 @@ def page_tasks(user, selected_client_id=None):
             key=f"status_filt_{selected_client_id}",
         )
 
-    client_ids = [selected_client_id]
     assignee_id = 0
 
     df = load_tasks(user, period, client_ids, statuses, assignee_id)
     if df.empty:
-        st.info(f"Khách hàng **{sel_client['code']}** chưa có công việc nào trong kỳ **{period_label(period)}**.")
+        who = "Các khách hàng đã chọn" if all_mode else f"Khách hàng **{sel_client['name']}**"
+        st.info(f"{who} chưa có công việc nào trong kỳ **{period_label(period)}**.")
         return
 
     export = pd.DataFrame(
         {
-            "Khách hàng": df["client_code"] + " - " + df["client_name"],
+            "Khách hàng": df["client_name"],
             "Bước": df["step"].map(STEP_NAMES),
             "Hạng mục": df["sub_item"],
             "Sắc thuế": df["tax_type"],
@@ -2145,14 +2157,14 @@ def page_tasks(user, selected_client_id=None):
             "Ghi chú kiểm tra": df["check_note"],
         }
     )
-    csv_file = f"cong_viec_{sel_client['code']}_{period}.csv"
+    csv_file = f"cong_viec_{'tat_ca' if all_mode else sel_client['code']}_{period}.csv"
     st.download_button(
         "⬇️ Xuất CSV (mở được bằng Excel)",
         data=export.to_csv(index=False).encode("utf-8-sig"),
         file_name=csv_file,
         mime="text/csv",
     )
-    filt_key = f"{period}_{'-'.join(map(str, client_ids))}_{'-'.join(statuses)}_{assignee_id}"
+    filt_key = f"{period}_{'all' if all_mode else selected_client_id}_{len(client_ids)}_{'-'.join(statuses)}_{assignee_id}"
     tabs = st.tabs([STEP_NAMES[s] for s in STEPS])
     for tab, step in zip(tabs, STEPS):
         with tab:
@@ -2539,17 +2551,16 @@ def main():
         menu_items = {}
         menu_items["📊 Tổng quan"] = page_dashboard
 
-        default_client_id = filtered_clients[0]["id"] if filtered_clients else (clients[0]["id"] if clients else None)
-        menu_items["✅ Công việc hàng tháng"] = lambda u: page_tasks(u, st.session_state.get("last_selected_client_id", default_client_id))
+        menu_items["✅ Công việc hàng tháng"] = lambda u: page_tasks(u, None)
 
         for c in filtered_clients:
             c_name = c["name"]
             if len(c_name) > 32:
                 c_name = c_name[:30] + "…"
             # Nhãn chỉ gồm tên khách hàng; thụt lề phân cấp được thêm bằng CSS bên dưới
-            label = c_name
+            label = f"↳ {c_name}"
             if label in menu_items:  # trùng tên: phân biệt bằng MST (hoặc số thứ tự)
-                label = f"{c_name} ({c['tax_code'] or c['id']})"
+                label = f"↳ {c_name} ({c['tax_code'] or c['id']})"
             cid = c["id"]
 
             def make_handler(client_id):
@@ -2571,18 +2582,17 @@ def main():
         if filtered_clients:
             # Các khách hàng nằm ngay sau 2 mục đầu (Tổng quan, Công việc hàng tháng): thụt vào dưới "Công việc hàng tháng"
             last = 2 + len(filtered_clients)
+            sel = (
+                '[data-testid="stSidebar"] [role="radiogroup"] > label'
+                f":nth-child(n+3):nth-child(-n+{last})"
+            )
             st.markdown(
                 "<style>"
-                '[data-testid="stSidebar"] .stRadio div[role="radiogroup"] > '
-                f"label:nth-child(n+3):nth-child(-n+{last}) {{"
-                "margin-left: 28px !important; width: calc(100% - 28px) !important; font-size: 0.92rem;"
-                "border-left: 2px solid rgba(255,255,255,0.25); border-radius: 0 8px 8px 0; }"
-                '[data-testid="stSidebar"] .stRadio div[role="radiogroup"] > '
-                f"label:nth-child(n+3):nth-child(-n+{last}):hover {{"
-                "border-left-color: #A3E635; background: rgba(255,255,255,0.18); }"
-                '[data-testid="stSidebar"] .stRadio div[role="radiogroup"] > '
-                f"label:nth-child(n+3):nth-child(-n+{last}):has(input:checked) {{"
-                "border-left-color: #A3E635; background: rgba(255,255,255,0.22); }"
+                f"{sel} {{ margin-left: 26px !important; padding-left: 10px !important; "
+                "width: calc(100% - 26px) !important; font-size: 0.92rem; "
+                "border-left: 2px solid rgba(255,255,255,0.35); border-radius: 0 8px 8px 0; }"
+                f"{sel}:hover {{ border-left-color: #A3E635; background: rgba(255,255,255,0.18); }}"
+                f"{sel}:has(input:checked) {{ border-left-color: #A3E635; background: rgba(255,255,255,0.22); }}"
                 "</style>",
                 unsafe_allow_html=True,
             )
