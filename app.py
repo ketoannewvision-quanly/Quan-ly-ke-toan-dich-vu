@@ -15,7 +15,7 @@ QUY TRÌNH HÀNG THÁNG
   B2. Kê khai thuế (theo sắc thuế, kỳ T/Q/N)     - có Ngày hoàn thành, cảnh báo hạn
   B3. Nộp tiền thuế (theo sắc thuế, kỳ T/Q/N)    - số phát sinh, đã nộp, thừa/thiếu, cảnh báo hạn
   B4. Tự kiểm tra: người phụ trách tự ghi vấn đề và đã chỉnh sửa hay chưa
-  B5. Soát xét cấp 2: người kiểm tra ghi vấn đề + hướng xử lý; người phụ trách giải trình,
+  B5. Soát xét: người kiểm tra ghi vấn đề + hướng xử lý; người phụ trách giải trình,
       chỉnh sửa và cập nhật đã sửa xong hay chưa
   B6. Lưu trữ hồ sơ: người phụ trách cập nhật; người kiểm tra cập nhật tình trạng kiểm tra
 
@@ -76,7 +76,7 @@ STEP_NAMES = {
     "B2": "B2. Kê khai thuế",
     "B3": "B3. Nộp tiền thuế",
     "B4": "B4. Tự kiểm tra",
-    "B5": "B5. Soát xét cấp 2",
+    "B5": "B5. Soát xét",
     "B6": "B6. Lưu trữ hồ sơ",
 }
 
@@ -92,7 +92,7 @@ B1_ITEMS = [
     "Kết chuyển lãi lỗ",
 ]
 B4_ITEM = "Tự kiểm tra hồ sơ kỳ"
-B5_ITEM = "Soát xét cấp 2 hồ sơ kỳ"
+B5_ITEM = "Soát xét hồ sơ kỳ"
 B6_ITEM = "Lưu trữ hồ sơ kỳ"
 
 TAX_TYPES = [
@@ -1174,7 +1174,7 @@ def render_step(user, step, sdf, period, client_ids, filt_key):
 
 
 # ----------------------------------------------------------------------------
-# VẤN ĐỀ KIỂM TRA: B4 (tự kiểm tra) VÀ B5 (soát xét cấp 2)
+# VẤN ĐỀ KIỂM TRA: B4 (tự kiểm tra) VÀ B5 (soát xét)
 # ----------------------------------------------------------------------------
 ISSUE_COLS = [
     "id", "kind", "client_id", "period", "issue", "solution", "checker_id", "handler_id",
@@ -1376,7 +1376,7 @@ def render_issues(user, period, client_ids, kind):
     if kind == "self":
         st.markdown("#### Vấn đề tự kiểm tra và tình trạng chỉnh sửa")
     else:
-        st.markdown("#### Vấn đề soát xét cấp 2, giải trình và tình trạng sửa")
+        st.markdown("#### Vấn đề soát xét, giải trình và tình trạng sửa")
     labels = {u["id"]: user_label(u) for u in load_users()}
 
     # Chỉ người được phân công bước này (B4/B5) của khách hàng đó mới được thêm vấn đề
@@ -1390,7 +1390,7 @@ def render_issues(user, period, client_ids, kind):
             ).fetchall()
         ]
     if eligible:
-        title = "➕ Ghi nhận vấn đề tự kiểm tra" if kind == "self" else "➕ Ghi nhận vấn đề soát xét cấp 2"
+        title = "➕ Ghi nhận vấn đề tự kiểm tra" if kind == "self" else "➕ Ghi nhận vấn đề soát xét"
         with st.expander(title):
             with st.form(f"add_{kind}_{period}_{ver()}", clear_on_submit=True):
                 cmap = {c["id"]: c for c in eligible}
@@ -1430,7 +1430,7 @@ def render_issues(user, period, client_ids, kind):
                     bump_ver()
                     st.rerun()
     else:
-        who = "tự kiểm tra" if kind == "self" else "soát xét cấp 2"
+        who = "tự kiểm tra" if kind == "self" else "soát xét"
         st.caption(f"Bạn chỉ thêm được vấn đề {who} cho khách hàng mà bạn được phân công ở bước {step} trong kỳ này.")
 
     df = load_issues(user, kind, period, client_ids)
@@ -1604,62 +1604,44 @@ def page_dashboard(user):
 # ----------------------------------------------------------------------------
 def page_tasks(user, selected_client_id=None):
     clients = load_clients(active_only=True)
-    cmap = {c["id"]: c for c in clients}
-
-    if selected_client_id and selected_client_id in cmap:
-        sel_client = cmap[selected_client_id]
-
-        top_c1, top_c2 = st.columns([4, 1])
-        with top_c1:
-            st.header(f"🏢 {client_label(sel_client)}")
-        with top_c2:
-            if st.button("📋 Tất cả KH", help="Chuyển sang xem toàn bộ khách hàng"):
-                st.session_state["active_nav_choice"] = "\u00a0\u00a0├─ 📋 Tất cả khách hàng"
-                st.rerun()
-
-        info_items = []
-        if sel_client.get("tax_code"):
-            info_items.append(f"**MST:** `{sel_client['tax_code']}`")
-        if sel_client.get("staff_name"):
-            info_items.append(f"**Phụ trách:** {sel_client['staff_name']}")
-        if sel_client.get("reviewer_name"):
-            info_items.append(f"**Kiểm tra:** {sel_client['reviewer_name']}")
-        if info_items:
-            st.caption(" · ".join(info_items))
-
-        f1, f2 = st.columns([2, 1])
-        with f1:
-            period = period_selector("tasks")
-        with f2:
-            statuses = st.multiselect(
-                "Lọc trạng thái (tùy chọn)",
-                STATUSES,
-                key=f"status_filt_{selected_client_id}",
-            )
-
-        client_ids = [selected_client_id]
-        assignee_id = 0
-    else:
+    if not clients:
         st.header("✅ Công việc kế toán dịch vụ hàng tháng")
+        st.info("Chưa có khách hàng nào đang hoạt động. Quản trị viên vui lòng thêm khách hàng ở mục 'Khách hàng'.")
+        return
+
+    cmap = {c["id"]: c for c in clients}
+    if not selected_client_id or selected_client_id not in cmap:
+        selected_client_id = clients[0]["id"]
+
+    sel_client = cmap[selected_client_id]
+    st.header(client_label(sel_client))
+
+    info_items = []
+    if sel_client.get("tax_code"):
+        info_items.append(f"**MST:** `{sel_client['tax_code']}`")
+    if sel_client.get("staff_name"):
+        info_items.append(f"**Phụ trách:** {sel_client['staff_name']}")
+    if sel_client.get("reviewer_name"):
+        info_items.append(f"**Kiểm tra:** {sel_client['reviewer_name']}")
+    if info_items:
+        st.caption(" · ".join(info_items))
+
+    f1, f2 = st.columns([2, 1])
+    with f1:
         period = period_selector("tasks")
-        f1, f2, f3 = st.columns(3)
-        client_ids = f1.multiselect("Khách hàng", list(cmap.keys()), format_func=lambda i: client_label(cmap[i]))
-        statuses = f2.multiselect("Trạng thái", STATUSES)
-        assignee_id = 0
-        if is_privileged(user):
-            umap = {u["id"]: u for u in load_users(active_only=True)}
-            assignee_id = f3.selectbox(
-                "Người phụ trách",
-                [0] + list(umap.keys()),
-                format_func=lambda i: "Tất cả" if i == 0 else user_label(umap[i]),
-            )
+    with f2:
+        statuses = st.multiselect(
+            "Lọc trạng thái (tùy chọn)",
+            STATUSES,
+            key=f"status_filt_{selected_client_id}",
+        )
+
+    client_ids = [selected_client_id]
+    assignee_id = 0
 
     df = load_tasks(user, period, client_ids, statuses, assignee_id)
     if df.empty:
-        if selected_client_id and selected_client_id in cmap:
-            st.info(f"Khách hàng **{cmap[selected_client_id]['code']}** chưa có công việc nào trong kỳ **{period_label(period)}**.")
-        else:
-            st.info("Không có công việc phù hợp. Quản trị viên có thể sinh việc ở mục 'Sinh việc tự động'.")
+        st.info(f"Khách hàng **{sel_client['code']}** chưa có công việc nào trong kỳ **{period_label(period)}**.")
         return
 
     export = pd.DataFrame(
@@ -1679,7 +1661,7 @@ def page_tasks(user, selected_client_id=None):
             "Ghi chú kiểm tra": df["check_note"],
         }
     )
-    csv_file = f"cong_viec_{cmap[selected_client_id]['code']}_{period}.csv" if (selected_client_id and selected_client_id in cmap) else f"cong_viec_{period}.csv"
+    csv_file = f"cong_viec_{sel_client['code']}_{period}.csv"
     st.download_button(
         "⬇️ Xuất CSV (mở được bằng Excel)",
         data=export.to_csv(index=False).encode("utf-8-sig"),
@@ -1713,7 +1695,7 @@ def page_clients(user):
             name = c2.text_input("Tên khách hàng *")
             mst = c1.text_input("Mã số thuế")
             staff = c2.selectbox("Nhân viên phụ trách", [0] + list(umap.keys()), format_func=ulabel)
-            reviewer = c1.selectbox("Người kiểm tra (soát xét cấp 2, kiểm tra lưu trữ)", [0] + reviewer_ids, format_func=ulabel)
+            reviewer = c1.selectbox("Người kiểm tra (soát xét, kiểm tra lưu trữ)", [0] + reviewer_ids, format_func=ulabel)
             taxes = st.multiselect(
                 "Sắc thuế phải kê khai (tần suất mặc định, chỉnh sau ở bảng bên dưới)",
                 TAX_TYPES, default=["GTGT", "TNCN", "TNDN"],
@@ -1981,7 +1963,7 @@ def page_generate(user):
         "Môn bài 30/01, các thuế khác 31/03 năm sau.\n"
         f"- Cảnh báo **sắp đến hạn** khi còn từ 0 đến {WARN_DAYS} ngày; **trễ hạn** khi quá hạn mà chưa hoàn thành.\n"
         "- **B4 Tự kiểm tra** (nhân viên phụ trách), hạn ngày 15 tháng sau.\n"
-        "- **B5 Soát xét cấp 2** (người kiểm tra), hạn ngày 25 tháng sau.\n"
+        "- **B5 Soát xét** (người kiểm tra), hạn ngày 25 tháng sau.\n"
         "- **B6 Lưu trữ hồ sơ** (nhân viên lưu trữ, người kiểm tra kiểm tra lại), hạn cuối tháng sau.\n"
         "- Hạn và người phụ trách có thể được quản trị viên chỉnh trực tiếp ở mục Công việc."
     )
@@ -2067,18 +2049,25 @@ def main():
 
         menu_items = {}
         menu_items["📊 Tổng quan"] = page_dashboard
-        menu_items["✅ Công việc hàng tháng"] = lambda u: page_tasks(u, None)
-        menu_items["\u00a0\u00a0├─ 📋 Tất cả khách hàng"] = lambda u: page_tasks(u, None)
 
-        for i, c in enumerate(filtered_clients):
-            is_last = (i == len(filtered_clients) - 1)
-            prefix = "\u00a0\u00a0└─ " if is_last else "\u00a0\u00a0├─ "
+        default_client_id = filtered_clients[0]["id"] if filtered_clients else (clients[0]["id"] if clients else None)
+        menu_items["✅ Công việc hàng tháng"] = lambda u: page_tasks(u, st.session_state.get("last_selected_client_id", default_client_id))
+
+        for c in filtered_clients:
             c_name = c["name"]
-            if len(c_name) > 28:
-                c_name = c_name[:26] + "…"
-            label = f"{prefix}🏢 {c['code']} - {c_name}"
+            if len(c_name) > 30:
+                c_name = c_name[:28] + "…"
+            # Thụt đầu dòng, không dùng ký hiệu ├─ hay icon 🏢
+            label = f"\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0{c['code']} - {c_name}"
             cid = c["id"]
-            menu_items[label] = (lambda client_id=cid: lambda u: page_tasks(u, client_id))()
+
+            def make_handler(client_id):
+                def handler(u):
+                    st.session_state["last_selected_client_id"] = client_id
+                    page_tasks(u, client_id)
+                return handler
+
+            menu_items[label] = make_handler(cid)
 
         if is_admin(user):
             menu_items["🏢 Khách hàng"] = page_clients
