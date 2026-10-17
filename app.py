@@ -121,8 +121,12 @@ def step_css():
         ".nv-step { padding: 10px 16px; border-radius: 10px; margin: 2px 0 10px 0; font-weight: 800;"
         " font-size: 1.1rem; letter-spacing: 0.4px; border-left: 8px solid var(--sc);"
         " background: var(--sc-bg); color: var(--sc-dark); }",
-        '[class*="st-key-stepbtn_"] button { width: 100%; min-height: 3.7rem; padding: 0.35rem 0.5rem;'
-        " border-radius: 12px !important; transition: all 0.15s ease-in-out; }",
+        '[class*="st-key-stepbtn_"], [class*="st-key-stepbtn_"] > div,'
+        ' [class*="st-key-stepbtn_"] [data-testid="stButton"] { display: block; width: 100% !important; }',
+        '[class*="st-key-stepbtn_"] button { width: 100% !important; height: 4.4rem !important;'
+        " min-height: 4.4rem !important; padding: 0.35rem 0.5rem; display: flex; align-items: center;"
+        " justify-content: center; text-align: center; border-radius: 12px !important;"
+        " transition: all 0.15s ease-in-out; }",
         '[class*="st-key-stepbtn_"] button p { white-space: normal; text-transform: uppercase;'
         " font-weight: 800 !important; font-size: 0.8rem !important; line-height: 1.25 !important;"
         " letter-spacing: 0.2px; }",
@@ -320,8 +324,8 @@ CSS = """
 }
 [data-testid="stSidebar"] .stRadio label { padding: 6px 10px; border-radius: 8px; font-weight: 500; font-size: 0.95rem; }
 [data-testid="stSidebar"] .stRadio label:hover { background: rgba(255,255,255,0.16); }
-[data-testid="stSidebar"] .stRadio label p { text-transform: uppercase; letter-spacing: 0.3px; font-weight: 600; font-size: 0.88rem; }
-.nv-side-name { color: #0F5132; font-weight: 800; font-size: 0.8rem; letter-spacing: 0.4px; line-height: 1.35; text-transform: uppercase; margin-top: 6px; }
+[data-testid="stSidebar"] .stRadio label p { text-transform: uppercase; letter-spacing: 0.3px; font-weight: 700; font-size: 0.95rem; }
+.nv-side-name { color: #0F5132; font-weight: 800; font-size: 1.12rem; letter-spacing: 0.3px; line-height: 1.3; text-transform: uppercase; text-align: center; margin-top: 8px; }
 .nv-step-bar { margin-top: 6px; }
 [data-testid="stSidebar"] .stTextInput input {
     background: rgba(255, 255, 255, 0.15);
@@ -403,8 +407,8 @@ CSS = """
     padding: 18px 12px 10px 12px; margin-bottom: 14px; box-shadow: 0 3px 12px rgba(11,61,32,0.10); }
 .nv-login img { width: 270px; max-width: 80%; height: auto; }
 .nv-login-title { font-size: 1.15rem; font-weight: 700; color: #0F5132; margin: 4px 0 8px 0; }
-.nv-side-brand { background: #FFFFFF; border-radius: 14px; padding: 8px; margin: 2px 0 12px 0; text-align: center; }
-.nv-side-brand img { width: 100%; height: auto; }
+.nv-side-brand { background: #FFFFFF; border-radius: 14px; padding: 12px 10px; margin: 2px 0 12px 0; text-align: center; }
+.nv-side-brand img { width: 76px; height: auto; display: block; margin: 0 auto; }
 </style>
 """
 CSS = CSS.replace("</style>", step_css() + "\n</style>")
@@ -2232,7 +2236,7 @@ def page_tasks(user, selected_client_id=None):
         st.session_state["active_step"] = STEPS[0]
     step_cols = st.columns(len(STEPS))
     for col, s in zip(step_cols, STEPS):
-        if col.button(STEP_NAMES[s].upper(), key=f"stepbtn_{s}"):
+        if full_width_call(col.button, STEP_NAMES[s].upper(), key=f"stepbtn_{s}"):
             st.session_state["active_step"] = s
     active_step = st.session_state["active_step"]
     st.markdown(step_active_css(active_step), unsafe_allow_html=True)
@@ -2600,42 +2604,55 @@ def main():
         if alerts:
             st.write(f"🔴 {n_late} trễ hạn · 🟠 {n_soon} sắp đến hạn (B2/B3)")
 
-        # Tìm kiếm nhanh khách hàng nếu danh sách từ 6 khách hàng trở lên
-        filtered_clients = clients
-        if len(clients) >= 6:
+        TOP_LABEL = "📊 Tổng quan"
+        PARENT_LABEL = "✅ Công việc hàng tháng"
+        reserved = {TOP_LABEL, PARENT_LABEL, "🏢 Khách hàng", "👥 Người dùng",
+                    "⚙️ Sinh việc tự động", "📜 Nhật ký hệ thống", "🔑 Đổi mật khẩu"}
+
+        # Nhãn của tất cả công ty (đầy đủ tên, không có ký hiệu mũi tên)
+        client_labels = {}
+        for c in clients:
+            label = c["name"]
+            if label in reserved or label in client_labels:  # trùng tên: phân biệt bằng MST (hoặc số thứ tự)
+                label = f"{c['name']} ({c['tax_code'] or c['id']})"
+            client_labels[label] = c["id"]
+
+        # Danh sách công ty chỉ hiện khi đang ở mục CÔNG VIỆC HÀNG THÁNG hoặc một công ty; mục khác thì thu gọn
+        prev_choice = st.session_state.get("active_nav_choice", TOP_LABEL)
+        work_set = {PARENT_LABEL} | set(client_labels)
+        expanded = prev_choice in work_set
+
+        shown_labels = list(client_labels.keys())
+        if expanded and len(clients) >= 6:
+            # Tìm kiếm nhanh công ty nếu có từ 6 công ty trở lên
             c_kw = st.text_input(
                 "Tìm khách hàng",
                 value="",
-                placeholder="🔍 Tìm tên hoặc MST khách hàng...",
+                placeholder="🔍 Tìm tên hoặc MST công ty...",
                 key="sidebar_search_client",
                 label_visibility="collapsed",
             ).strip().lower()
             if c_kw:
-                filtered_clients = [
-                    c for c in clients
-                    if c_kw in c["name"].lower() or c_kw in (c["tax_code"] or "").lower()
+                by_id = {c["id"]: c for c in clients}
+                shown_labels = [
+                    lb for lb, cid in client_labels.items()
+                    if c_kw in by_id[cid]["name"].lower() or c_kw in (by_id[cid]["tax_code"] or "").lower()
                 ]
+        if not expanded:
+            shown_labels = []
 
         menu_items = {}
-        menu_items["📊 Tổng quan"] = page_dashboard
+        menu_items[TOP_LABEL] = page_dashboard
+        menu_items[PARENT_LABEL] = lambda u: page_tasks(u, None)
 
-        menu_items["✅ Công việc hàng tháng"] = lambda u: page_tasks(u, None)
+        def make_handler(client_id):
+            def handler(u):
+                st.session_state["last_selected_client_id"] = client_id
+                page_tasks(u, client_id)
+            return handler
 
-        for c in filtered_clients:
-            c_name = c["name"]  # hiển thị đầy đủ tên công ty
-            # Nhãn chỉ gồm tên khách hàng; thụt lề phân cấp được thêm bằng CSS bên dưới
-            label = f"↳ {c_name}"
-            if label in menu_items:  # trùng tên: phân biệt bằng MST (hoặc số thứ tự)
-                label = f"↳ {c_name} ({c['tax_code'] or c['id']})"
-            cid = c["id"]
-
-            def make_handler(client_id):
-                def handler(u):
-                    st.session_state["last_selected_client_id"] = client_id
-                    page_tasks(u, client_id)
-                return handler
-
-            menu_items[label] = make_handler(cid)
+        for label in shown_labels:
+            menu_items[label] = make_handler(client_labels[label])
 
         if is_admin(user):
             menu_items["🏢 Khách hàng"] = page_clients
@@ -2645,9 +2662,9 @@ def main():
         menu_items["🔑 Đổi mật khẩu"] = lambda u: page_change_password(u)
 
         options = list(menu_items.keys())
-        if filtered_clients:
-            # Các khách hàng nằm ngay sau 2 mục đầu (Tổng quan, Công việc hàng tháng): thụt vào dưới "Công việc hàng tháng"
-            last = 2 + len(filtered_clients)
+        if shown_labels:
+            # Các công ty nằm ngay sau 2 mục đầu: thụt vào, chữ nhỏ hơn mục CÔNG VIỆC HÀNG THÁNG
+            last = 2 + len(shown_labels)
             sel = (
                 '[data-testid="stSidebar"] [role="radiogroup"] > label'
                 f":nth-child(n+3):nth-child(-n+{last})"
@@ -2655,18 +2672,18 @@ def main():
             st.markdown(
                 "<style>"
                 f"{sel} {{ margin-left: 26px !important; padding-left: 10px !important; "
-                "width: calc(100% - 26px) !important; font-size: 0.84rem; "
+                "width: calc(100% - 26px) !important; "
                 "border-left: 2px solid rgba(255,255,255,0.35); border-radius: 0 8px 8px 0; }"
                 f"{sel} p {{ white-space: normal !important; overflow: visible !important; "
-                "text-overflow: clip !important; font-size: 0.84rem !important; line-height: 1.3 !important; }}"
+                "text-overflow: clip !important; font-size: 0.74rem !important; font-weight: 500 !important; "
+                "line-height: 1.3 !important; letter-spacing: 0.1px !important; }"
                 f"{sel}:hover {{ border-left-color: #A3E635; background: rgba(255,255,255,0.18); }}"
                 f"{sel}:has(input:checked) {{ border-left-color: #A3E635; background: rgba(255,255,255,0.22); }}"
                 "</style>",
                 unsafe_allow_html=True,
             )
-        prev_choice = st.session_state.get("active_nav_choice", options[0])
         if prev_choice not in options:
-            prev_choice = options[1] if len(options) > 1 else options[0]
+            prev_choice = PARENT_LABEL if prev_choice in work_set else options[0]
 
         choice = st.radio(
             "Chức năng",
@@ -2675,6 +2692,8 @@ def main():
             label_visibility="collapsed",
         )
         st.session_state["active_nav_choice"] = choice
+        if (choice in work_set) != expanded:
+            st.rerun()  # mở/thu gọn danh sách công ty ngay khi vào/rời mục CÔNG VIỆC HÀNG THÁNG
 
         st.divider()
         if st.button("Đăng xuất"):
