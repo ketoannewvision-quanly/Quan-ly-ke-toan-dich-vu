@@ -53,7 +53,7 @@ SESSION_TIMEOUT_MIN = 30
 MAX_FAILED_ATTEMPTS = 5
 LOCK_MINUTES = 15
 PBKDF2_ITERATIONS = 200_000
-SCHEMA_VERSION = 3  # tăng khi đổi cấu trúc DB để nâng cấp chạy lại (init_once được cache)
+SCHEMA_VERSION = 4  # tăng khi đổi cấu trúc DB để nâng cấp chạy lại (init_once được cache)
 WARN_DAYS = 5  # cảnh báo "sắp đến hạn" khi còn <= số ngày này
 
 ROLES = {
@@ -171,7 +171,7 @@ B6_ITEMS = [
 B7_ITEM = "Lưu trữ hồ sơ kỳ"  # tên cũ (bản trước), được chuyển thành B7_DOC khi nâng cấp
 # B7: lưu trữ theo 4 nhóm hồ sơ
 B7_DOC = "Chứng từ hạch toán"      # theo tháng hạch toán
-B7_BOOK = "Sổ sách kế toán"        # chỉ lưu trữ sau khi hoàn thành tất cả các việc khác của kỳ
+B7_BOOK = "Sổ sách kế toán"        # lưu trữ cho CẢ NĂM (chỉ ở kỳ Tháng 12), sau khi hoàn thành mọi việc khác của năm
 B7_GROUPS = ["Chứng từ hạch toán", "Tờ khai thuế", "Hồ sơ quyết toán năm", "Sổ sách kế toán"]
 
 
@@ -531,6 +531,13 @@ def init_db():
             )
             if cur.rowcount == 0:  # đã có dòng mới trùng khóa
                 db.execute("DELETE FROM tasks WHERE id=?", (r["id"],))
+        # B7: Sổ sách kế toán lưu trữ cho cả năm (chỉ ở kỳ Tháng 12), bỏ các dòng theo từng tháng cũ
+        db.execute("DELETE FROM tasks WHERE step='B7' AND sub_item=? AND substr(period, 6, 2)<>'12'", (B7_BOOK,))
+        db.execute(
+            "UPDATE OR IGNORE tasks SET tax_period='Năm ' || substr(period, 1, 4) "
+            "WHERE step='B7' AND sub_item=? AND tax_period LIKE 'Tháng%'", (B7_BOOK,)
+        )
+        db.execute("DELETE FROM tasks WHERE step='B7' AND sub_item=? AND tax_period LIKE 'Tháng%'", (B7_BOOK,))
         fill_b6_defaults(db)
         count = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         if count == 0:
@@ -1071,7 +1078,8 @@ def generate_tasks(year, month, actor):
             if month == 12:
                 for sub, ttype in B6_ITEMS:
                     rows.append(("B7", f"Hồ sơ {sub}", ttype, f"Năm {year}", staff, reviewer, d7_year))
-            rows.append(("B7", B7_BOOK, "", tp_month, staff, reviewer, d7_year if month == 12 else d7))
+            if month == 12:  # sổ sách kế toán lưu trữ cho cả năm, không theo dõi từng tháng
+                rows.append(("B7", B7_BOOK, "", f"Năm {year}", staff, reviewer, d7_year))
             for step, sub, tax, tperiod, assignee, checker, due in rows:
                 cur = db.execute(
                     "INSERT OR IGNORE INTO tasks (client_id, period, step, sub_item, tax_type, tax_period, "
@@ -1322,14 +1330,16 @@ def task_column_config(labels):
 def completion_blocker(db, t, changes=None):
     """Điều kiện để một việc B4/B5/B6 được đánh dấu 'Đã hoàn thành'."""
     if t["step"] == "B7" and t["sub_item"] == B7_BOOK:
+        year = t["period"][:4]
         n = db.execute(
-            "SELECT COUNT(*) FROM tasks WHERE client_id=? AND period=? AND id<>? "
+            "SELECT COUNT(*) FROM tasks WHERE client_id=? AND period LIKE ? AND id<>? "
             "AND status NOT IN ('Đã hoàn thành','Không phát sinh')",
-            (t["client_id"], t["period"], t["id"]),
+            (t["client_id"], f"{year}-%", t["id"]),
         ).fetchone()[0]
         if n:
-            return (f"sổ sách chỉ được lưu trữ sau khi hoàn thành tất cả: còn {n} đầu việc khác của kỳ này "
-                    "(B1 đến B6 và các mục lưu trữ chứng từ, tờ khai, hồ sơ quyết toán) chưa hoàn thành.")
+            return (f"sổ sách kế toán được lưu trữ cho cả năm {year} và chỉ lưu trữ sau khi hoàn thành tất cả: "
+                    f"còn {n} đầu việc khác của năm {year} (B1 đến B6 và các mục lưu trữ chứng từ, tờ khai, "
+                    "hồ sơ quyết toán) chưa hoàn thành.")
     if t["step"] == "B6":
         eff = dict(t)
         eff.update(changes or {})
@@ -1683,10 +1693,17 @@ def render_step(user, step, sdf, period, client_ids, filt_key):
         "B5": "Người kiểm tra ghi vấn đề và hướng xử lý; người phụ trách giải trình, sửa và cập nhật tình trạng.",
         "B6": "Theo dõi tình trạng nộp tờ khai và số tiền thuế phát sinh (QT TNDN, QT TNCN, BCTC, TMBCTC).",
         "B7": "Theo dõi lưu trữ: chứng từ hạch toán theo tháng, tờ khai thuế theo kỳ khai, hồ sơ quyết toán năm và "
-              "sổ sách kế toán (chỉ lưu trữ sổ sách sau khi hoàn thành tất cả các việc khác của kỳ). "
+              "sổ sách kế toán (lưu trữ cho cả năm, theo dõi ở kỳ Tháng 12 và chỉ lưu trữ sau khi hoàn thành tất cả các việc khác của năm). "
               "Người phụ trách cập nhật ngày và nơi lưu trữ; người kiểm tra cập nhật tình trạng kiểm tra hồ sơ.",
     }
     st.caption(captions[step])
+    if step == "B7" and period[5:7] != "12":
+        st.info(f"Sổ sách kế toán lưu trữ cho **cả năm {period[:4]}**, không theo dõi từng tháng. "
+                f"Mục này nằm ở kỳ **Tháng 12/{period[:4]}**.")
+        if st.button(f"📅 Xem sổ sách kế toán năm {period[:4]} (Tháng 12/{period[:4]})",
+                     key=f"btn_goto_dec_b7_{filt_key}"):
+            st.session_state["period_tasks"] = f"{period[:4]}-12"
+            st.rerun()
 
     if not sdf.empty:
         st.markdown("**✏️ Việc của tôi (được phép cập nhật)**")
@@ -2662,38 +2679,49 @@ def main():
         menu_items["🔑 Đổi mật khẩu"] = lambda u: page_change_password(u)
 
         options = list(menu_items.keys())
+        top_opts = [TOP_LABEL, PARENT_LABEL]
+        bottom_opts = [o for o in options if o not in top_opts and o not in shown_labels]
+        active = prev_choice
+        if active not in options:
+            active = PARENT_LABEL if active in work_set else options[0]
+
         if shown_labels:
-            # Các công ty nằm ngay sau 2 mục đầu: thụt vào, chữ nhỏ hơn mục CÔNG VIỆC HÀNG THÁNG
-            last = 2 + len(shown_labels)
-            sel = (
-                '[data-testid="stSidebar"] [role="radiogroup"] > label'
-                f":nth-child(n+3):nth-child(-n+{last})"
-            )
+            # Nhóm công ty: thụt vào 1cm (cả nút tròn lẫn tên), chữ nhỏ hơn mục CÔNG VIỆC HÀNG THÁNG
             st.markdown(
                 "<style>"
-                f"{sel} {{ margin-left: 26px !important; padding-left: 10px !important; "
-                "width: calc(100% - 26px) !important; "
-                "border-left: 2px solid rgba(255,255,255,0.35); border-radius: 0 8px 8px 0; }"
-                f"{sel} p {{ white-space: normal !important; overflow: visible !important; "
-                "text-overflow: clip !important; font-size: 0.74rem !important; font-weight: 500 !important; "
-                "line-height: 1.3 !important; letter-spacing: 0.1px !important; }"
-                f"{sel}:hover {{ border-left-color: #A3E635; background: rgba(255,255,255,0.18); }}"
-                f"{sel}:has(input:checked) {{ border-left-color: #A3E635; background: rgba(255,255,255,0.22); }}"
+                ".st-key-nav_group_1 { margin-left: 1cm !important; width: calc(100% - 1cm) !important; }"
+                ".st-key-nav_group_1 label { padding: 3px 6px !important; }"
+                ".st-key-nav_group_1 label p { font-size: 0.68rem !important; font-weight: 500 !important;"
+                " line-height: 1.3 !important; letter-spacing: 0.1px !important; white-space: normal !important; }"
                 "</style>",
                 unsafe_allow_html=True,
             )
-        if prev_choice not in options:
-            prev_choice = PARENT_LABEL if prev_choice in work_set else options[0]
 
-        choice = st.radio(
-            "Chức năng",
-            options,
-            index=options.index(prev_choice),
-            label_visibility="collapsed",
-        )
+        def nav_group(opts, gid):
+            try:
+                box = st.container(key=f"nav_group_{gid}")
+            except TypeError:  # Streamlit cũ không hỗ trợ key cho container
+                box = st.container()
+            with box:
+                return st.radio(
+                    "Chức năng",
+                    opts,
+                    index=opts.index(active) if active in opts else None,
+                    label_visibility="collapsed",
+                )
+
+        new_choice = None
+        for gid, opts in enumerate([top_opts, shown_labels, bottom_opts]):
+            if not opts:
+                continue
+            val = nav_group(opts, gid)
+            if val is not None and val != active:
+                new_choice = val
+        if new_choice is not None:
+            st.session_state["active_nav_choice"] = new_choice
+            st.rerun()  # cập nhật mục đang chọn; mở/thu gọn danh sách công ty
+        choice = active
         st.session_state["active_nav_choice"] = choice
-        if (choice in work_set) != expanded:
-            st.rerun()  # mở/thu gọn danh sách công ty ngay khi vào/rời mục CÔNG VIỆC HÀNG THÁNG
 
         st.divider()
         if st.button("Đăng xuất"):
