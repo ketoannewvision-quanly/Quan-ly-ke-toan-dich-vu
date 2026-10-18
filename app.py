@@ -1345,9 +1345,10 @@ def render_alerts(user):
         st.success(f"Không có việc B2/B3 nào trễ hạn hoặc sắp đến hạn (trong {WARN_DAYS} ngày tới).")
         return
     late = sum(1 for r in rows if deadline_info(r["due_date"], r["status"])[1] == "late")
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     c1.metric("🔴 Trễ hạn", late)
     c2.metric("🟠 Sắp đến hạn", len(rows) - late)
+    c3.metric("Số khách hàng liên quan", len({r["client_id"] for r in rows}))
     out = pd.DataFrame(
         {
             "Cảnh báo": [deadline_info(r["due_date"], r["status"])[0] for r in rows],
@@ -1497,8 +1498,17 @@ def auto_generate_recent(actor):
     generate_tasks(today.year, 12, actor)
 
 
-def sync_assignees(period, actor):
-    """Cập nhật người phụ trách/người kiểm tra các việc chưa hoàn thành theo cấu hình khách hàng."""
+def sync_assignees(period, actor, client_id=None):
+    """Cập nhật người phụ trách/người kiểm tra các việc CHƯA hoàn thành theo cấu hình khách hàng hiện tại.
+    period=None: mọi kỳ. client_id=None: mọi khách hàng."""
+    where = ["status NOT IN ('Đã hoàn thành','Không phát sinh')"]
+    params = [actor, now_str()]
+    if period:
+        where.append("period=?")
+        params.append(period)
+    if client_id:
+        where.append("client_id=?")
+        params.append(client_id)
     with get_db() as db:
         cur = db.execute(
             "UPDATE tasks SET "
@@ -1507,12 +1517,11 @@ def sync_assignees(period, actor):
             "  ELSE (SELECT staff_id FROM clients WHERE id=tasks.client_id) END, "
             "checker_id = CASE WHEN step IN ('B6','B7') "
             "  THEN (SELECT reviewer_id FROM clients WHERE id=tasks.client_id) ELSE checker_id END, "
-            "updated_by=?, updated_at=? "
-            "WHERE period=? AND status NOT IN ('Đã hoàn thành','Không phát sinh')",
-            (actor, now_str(), period),
+            "updated_by=?, updated_at=? WHERE " + " AND ".join(where),
+            params,
         )
         n = cur.rowcount
-    log_action(actor, "DONG_BO_NGUOI_PHU_TRACH", f"Kỳ {period}: {n} việc")
+    log_action(actor, "DONG_BO_NGUOI_PHU_TRACH", f"Kỳ {period or 'tất cả'}, KH {client_id or 'tất cả'}: {n} việc")
     return n
 
 
@@ -2633,50 +2642,124 @@ def page_change_password(user, forced=False):
 # ----------------------------------------------------------------------------
 # TRANG: TỔNG QUAN
 # ----------------------------------------------------------------------------
+STEP_STATE_ICON = {"done": "✅", "late": "🔴", "doing": "🟡", "todo": "⬜", "none": "—"}
+
+
+def step_state(sub):
+    """Trạng thái của một khách hàng ở một bước: done / late / doing / todo / none (không có việc)."""
+    if sub.empty:
+        return "none"
+    done = sub["status"].isin(DONE_STATUSES)
+    if done.all():
+        return "done"
+    if any(deadline_info(d, s)[1] == "late" for d, s in zip(sub["due_date"], sub["status"])):
+        return "late"
+    if done.any() or (sub["status"] != "Chưa thực hiện").any():
+        return "doing"
+    return "todo"
+
+
+def client_progress(df):
+    """Tổng hợp tiến độ theo từng khách hàng trong kỳ: trạng thái từng bước và trạng thái chung."""
+    out = []
+    for cid, g in df.groupby("client_id"):
+        states = {s: step_state(g[g["step"] == s]) for s in STEPS}
+        present = [v for v in states.values() if v != "none"]
+        if all(v == "done" for v in present):
+            overall = "done"
+        elif any(v == "late" for v in present):
+            overall = "late"
+        elif all(v == "todo" for v in present):
+            overall = "todo"
+        else:
+            overall = "doing"
+        out.append({"client_id": cid, "client": f"{g['client_code'].iloc[0]} - {g['client_name'].iloc[0]}",
+                    "states": states, "overall": overall, "tasks": len(g), "done": int(g["status"].isin(DONE_STATUSES).sum())})
+    return out
+
+
 def page_dashboard(user):
     st.header("📊 Tổng quan tiến độ")
-    render_issue_overview(user)
-    st.divider()
+    # 1) Cảnh báo hạn kê khai / nộp thuế: ưu tiên trên cùng
     render_alerts(user)
     st.divider()
+
+    # 2) Tiến độ theo số lượng khách hàng
     period = period_selector("tasks")
     df = load_tasks(user, period)
     if df.empty:
         st.info("Chưa có công việc trong kỳ này. Quản trị viên có thể sinh việc ở mục 'Sinh việc tự động'.")
+        st.divider()
+        render_issue_overview(user)
         return
     df["done"] = df["status"].isin(DONE_STATUSES)
     df["client"] = df["client_code"] + " - " + df["client_name"]
-    total = len(df)
-    n_done = int(df["done"].sum())
+    prog = client_progress(df)
+    n_cli = len(prog)
+    cnt = {k: sum(1 for p in prog if p["overall"] == k) for k in ("done", "doing", "todo", "late")}
+
+    st.subheader(f"👥 Tiến độ theo số lượng khách hàng ({period_label(period)})")
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Tổng số việc", total)
-    c2.metric("Hoàn thành", f"{n_done} ({n_done * 100 // total}%)")
-    c3.metric("Đang xử lý", int((df["status"] == "Đang xử lý").sum()))
-    c4.metric("Chưa thực hiện", int((df["status"] == "Chưa thực hiện").sum()))
-    c5.metric("Vướng mắc", int((df["status"] == "Vướng mắc").sum()))
-    st.progress(n_done / total)
+    c1.metric("Tổng số khách hàng", n_cli)
+    c2.metric("✅ Hoàn thành toàn bộ", f"{cnt['done']} ({cnt['done'] * 100 // n_cli}%)")
+    c3.metric("🟡 Đang thực hiện", cnt["doing"])
+    c4.metric("⬜ Chưa bắt đầu", cnt["todo"])
+    c5.metric("🔴 Có việc trễ hạn", cnt["late"])
+    st.progress(cnt["done"] / n_cli, text=f"{cnt['done']}/{n_cli} khách hàng đã hoàn thành toàn bộ công việc của kỳ")
+    n_done_tasks = int(df["done"].sum())
+    st.caption(f"Tính theo việc: {n_done_tasks}/{len(df)} đầu việc đã hoàn thành ({n_done_tasks * 100 // len(df)}%).")
 
-    st.subheader("Tỷ lệ hoàn thành theo bước")
-    by_step = df.groupby("step").agg(Tong=("id", "count"), Xong=("done", "sum"))
-    by_step["Tỷ lệ (%)"] = (by_step["Xong"] / by_step["Tong"] * 100).round(1)
-    by_step.index = [STEP_NAMES.get(s, s) for s in by_step.index]
-    by_step = by_step.rename(columns={"Tong": "Tổng", "Xong": "Hoàn thành"})
-    left, right = st.columns(2)
-    with left:
-        full_width_call(st.dataframe, by_step)
-    with right:
-        st.bar_chart(by_step["Tỷ lệ (%)"])
+    st.markdown("**Số khách hàng hoàn thành theo từng bước**")
+    step_rows = []
+    for s in STEPS:
+        states = [p["states"][s] for p in prog if p["states"][s] != "none"]
+        if not states:
+            continue
+        step_rows.append({
+            "Bước": STEP_NAMES[s],
+            "Số KH có bước này": len(states),
+            "✅ Hoàn thành": states.count("done"),
+            "🟡 Đang thực hiện": states.count("doing"),
+            "🔴 Trễ hạn": states.count("late"),
+            "⬜ Chưa bắt đầu": states.count("todo"),
+            "Tỷ lệ KH hoàn thành (%)": round(states.count("done") * 100 / len(states), 1),
+        })
+    if step_rows:
+        sdf = pd.DataFrame(step_rows).set_index("Bước")
+        left, right = st.columns([3, 2])
+        with left:
+            full_width_call(st.dataframe, sdf)
+        with right:
+            st.bar_chart(sdf["Tỷ lệ KH hoàn thành (%)"])
 
+    st.markdown("**Tình hình từng khách hàng**")
+    order = {"late": 0, "doing": 1, "todo": 2, "done": 3}
+    label = {"done": "✅ Hoàn thành", "late": "🔴 Có việc trễ hạn", "doing": "🟡 Đang thực hiện", "todo": "⬜ Chưa bắt đầu"}
+    rows = []
+    for p in sorted(prog, key=lambda x: (order[x["overall"]], x["client"])):
+        row = {"Khách hàng": p["client"], "Tình trạng chung": label[p["overall"]]}
+        for s in STEPS:
+            row[s] = STEP_STATE_ICON[p["states"][s]]
+        row["% việc hoàn thành"] = round(p["done"] * 100 / p["tasks"], 1)
+        rows.append(row)
+    full_width_call(
+        st.dataframe, pd.DataFrame(rows), hide_index=True,
+        column_config={"% việc hoàn thành": st.column_config.ProgressColumn(
+            "% việc hoàn thành", min_value=0, max_value=100, format="%.0f%%")},
+    )
+    st.caption("✅ hoàn thành · 🟡 đang thực hiện · 🔴 có việc trễ hạn · ⬜ chưa bắt đầu · — khách hàng không có việc ở bước này. "
+               + " · ".join(f"{s} = {STEP_NAMES[s].split('. ', 1)[-1].title()}" for s in STEPS))
+
+    # 3) B4 / B5
+    st.divider()
+    render_issue_overview(user)
+
+    # 4) Nộp thuế và việc quá hạn trong kỳ
     b3 = df[df["step"] == "B3"]
     if not b3.empty:
+        st.divider()
         st.subheader("Tình hình nộp thuế trong kỳ (B3)")
         b3_summary(b3)
-
-    st.subheader("Tình trạng theo khách hàng")
-    pt = df.pivot_table(index="client", columns="status", values="id", aggfunc="count", fill_value=0)
-    pt = pt.reindex(columns=STATUSES, fill_value=0)
-    pt["% hoàn thành"] = (df.groupby("client")["done"].mean().reindex(pt.index) * 100).round(1)
-    full_width_call(st.dataframe, pt)
 
     st.subheader("Việc quá hạn chưa hoàn thành trong kỳ")
     flags = [deadline_info(d, s)[1] for d, s in zip(df["due_date"], df["status"])]
@@ -2965,6 +3048,9 @@ def page_clients(user):
         has_start = e1.checkbox("Đặt ngày bắt đầu thực hiện", value=sd_val is not None)
         start = e2.date_input("Ngày bắt đầu thực hiện", value=sd_val or date.today(), format="DD/MM/YYYY")
         purge = st.checkbox("Dọn các việc còn trống của những kỳ trước tháng bắt đầu", value=True)
+        apply_assign = st.checkbox(
+            "Áp dụng người phụ trách / người kiểm tra mới cho các việc CHƯA hoàn thành (mọi kỳ)", value=True,
+            help="Nếu không tích, người mới chỉ nhận các việc được sinh ra sau này; việc đã sinh vẫn thuộc người cũ.")
         active = st.checkbox("Đang hoạt động (được sinh việc hàng tháng)", value=bool(c["active"]))
         note = st.text_area("Ghi chú", value=c["note"] or "")
         saved = st.form_submit_button("Lưu thông tin khách hàng")
@@ -2983,8 +3069,22 @@ def page_clients(user):
             log_action(user["username"], "SUA_KHACH_HANG", f"{c['code']} (bắt đầu {start_iso or 'chưa đặt'})")
             n_del = purge_untouched_before_start(sel, start_iso[:7]) if (start_iso and purge) else 0
             n_new = generate_client_from_start(sel, user["username"]) if active else 0
-            flash("success", f"Đã cập nhật khách hàng. Giao thêm {n_new} đầu việc, dọn {n_del} việc trống trước tháng bắt đầu. "
-                             "Dùng 'Đồng bộ người phụ trách' ở mục Sinh việc nếu cần áp dụng người phụ trách mới cho việc đã sinh.")
+            staff_changed = (staff or None) != c["staff_id"]
+            people_changed = staff_changed or (reviewer or None) != c["reviewer_id"]
+            n_re = n_iss = 0
+            if apply_assign and people_changed:
+                n_re = sync_assignees(None, user["username"], sel)
+                if staff_changed and staff:
+                    with get_db() as db:  # vấn đề soát xét B5 chưa sửa xong: chuyển cho nhân viên mới
+                        n_iss = db.execute(
+                            "UPDATE issues SET handler_id=? WHERE client_id=? AND kind='review' AND status<>'Đã sửa xong'",
+                            (staff, sel),
+                        ).rowcount
+            msg = f"Đã cập nhật khách hàng. Giao thêm {n_new} đầu việc, dọn {n_del} việc trống trước tháng bắt đầu."
+            if people_changed:
+                msg += (f" Đã chuyển {n_re} việc chưa hoàn thành (và {n_iss} vấn đề B5 chưa sửa) sang người phụ trách mới."
+                        if apply_assign else " Việc đã sinh vẫn thuộc người cũ (bạn không tích áp dụng cho việc chưa hoàn thành).")
+            flash("success", msg)
             bump_ver()
             st.rerun()
 
@@ -3162,6 +3262,11 @@ def page_generate(user):
                  help="Cập nhật người phụ trách/người kiểm tra các việc chưa hoàn thành của tháng đã chọn theo cấu hình khách hàng hiện tại."):
         n = sync_assignees(period_str(int(year), int(month)), user["username"])
         flash("success", f"Đã đồng bộ người phụ trách cho {n} việc chưa hoàn thành.")
+        st.rerun()
+    if st.button("Đồng bộ người phụ trách cho TẤT CẢ các kỳ",
+                 help="Áp dụng cấu hình người phụ trách/người kiểm tra hiện tại của từng khách hàng cho mọi việc chưa hoàn thành, ở mọi kỳ."):
+        n = sync_assignees(None, user["username"])
+        flash("success", f"Đã đồng bộ người phụ trách cho {n} việc chưa hoàn thành (tất cả các kỳ).")
         st.rerun()
     st.subheader("Quy tắc sinh việc")
     st.markdown(
