@@ -33,10 +33,12 @@ import base64
 import calendar
 import hashlib
 import io
+import json
 import hmac
 import os
 import re
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 
@@ -48,12 +50,25 @@ import streamlit as st
 # ----------------------------------------------------------------------------
 COMPANY = "NEW VISION"
 COMPANY_FULL = "CÔNG TY TNHH DỊCH VỤ TƯ VẤN NEW VISION"
-DB_PATH = os.environ.get("KETOAN_DB", "ketoan_dichvu.db")
+def _default_db_path():
+    """File dữ liệu nằm cạnh app.py, không phụ thuộc thư mục đang đứng khi gõ lệnh chạy.
+    Nếu trước đây dữ liệu đã nằm ở thư mục chạy (cách cũ) thì tiếp tục dùng file đó."""
+    base = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+    path = os.path.join(base, "ketoan_dichvu.db")
+    legacy = os.path.join(os.getcwd(), "ketoan_dichvu.db")
+    if not os.path.exists(path) and os.path.exists(legacy):
+        return legacy
+    return path
+
+
+DB_PATH = os.environ.get("KETOAN_DB") or _default_db_path()
+BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "backups")
+BACKUP_KEEP = 14  # số bản sao lưu giữ lại
 SESSION_TIMEOUT_MIN = 30
 MAX_FAILED_ATTEMPTS = 5
 LOCK_MINUTES = 15
 PBKDF2_ITERATIONS = 200_000
-SCHEMA_VERSION = 4  # tăng khi đổi cấu trúc DB để nâng cấp chạy lại (init_once được cache)
+SCHEMA_VERSION = 5  # tăng khi đổi cấu trúc DB để nâng cấp chạy lại (init_once được cache)
 WARN_DAYS = 5  # cảnh báo "sắp đến hạn" khi còn <= số ngày này
 
 ROLES = {
@@ -294,6 +309,11 @@ CREATE TABLE IF NOT EXISTS audit_log (
     username TEXT NOT NULL,
     action TEXT NOT NULL,
     detail TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS user_prefs (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    prefs TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_period ON tasks(period);
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee_id);
@@ -591,11 +611,144 @@ def ensure_theme_config():
         pass
 
 
+def backup_db(tag="tu-dong"):
+    """Sao lưu an toàn bằng API backup của SQLite; chỉ giữ BACKUP_KEEP bản gần nhất."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    dest = os.path.join(BACKUP_DIR, f"ketoan_{datetime.now():%Y%m%d_%H%M%S}_{tag}.db")
+    s, d = sqlite3.connect(DB_PATH), sqlite3.connect(dest)
+    try:
+        s.backup(d)
+    finally:
+        d.close()
+        s.close()
+    files = sorted(f for f in os.listdir(BACKUP_DIR) if f.startswith("ketoan_") and f.endswith(".db"))
+    for old in files[:-BACKUP_KEEP]:
+        try:
+            os.remove(os.path.join(BACKUP_DIR, old))
+        except OSError:
+            pass
+    return dest
+
+
+def list_backups():
+    if not os.path.isdir(BACKUP_DIR):
+        return []
+    files = sorted((f for f in os.listdir(BACKUP_DIR) if f.startswith("ketoan_") and f.endswith(".db")),
+                   reverse=True)
+    return [(f, os.path.getsize(os.path.join(BACKUP_DIR, f))) for f in files]
+
+
+def auto_backup_if_needed():
+    """Mỗi ngày tự sao lưu một bản (khi có người dùng truy cập)."""
+    today = datetime.now().strftime("%Y%m%d")
+    if any(name.startswith(f"ketoan_{today}") for name, _ in list_backups()):
+        return
+    try:
+        backup_db("tu-dong")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def snapshot_bytes():
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        s, d = sqlite3.connect(DB_PATH), sqlite3.connect(tmp)
+        try:
+            s.backup(d)
+        finally:
+            d.close()
+            s.close()
+        with open(tmp, "rb") as f:
+            return f.read()
+    finally:
+        os.remove(tmp)
+
+
+def restore_db_from_bytes(data):
+    """Khôi phục từ file .db: kiểm tra hợp lệ, sao lưu bản hiện tại trước, rồi ghi đè."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    tmp = os.path.join(BACKUP_DIR, "_restore_tmp.db")
+    with open(tmp, "wb") as f:
+        f.write(data)
+    try:
+        conn = sqlite3.connect(tmp)
+        try:
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not {"users", "clients", "tasks"} <= tables:
+                raise ValueError("File không phải cơ sở dữ liệu của hệ thống này (thiếu bảng users/clients/tasks).")
+            conn.execute("SELECT COUNT(*) FROM users").fetchone()
+        finally:
+            conn.close()
+        backup_db("truoc-khoi-phuc")
+        s, d = sqlite3.connect(tmp), sqlite3.connect(DB_PATH)
+        try:
+            s.backup(d)
+        finally:
+            d.close()
+            s.close()
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    init_db()  # nâng cấp cấu trúc nếu bản sao lưu từ phiên bản cũ
+
+
+PREF_KEYS = ("active_step", "period_tasks", "active_nav_choice")
+
+
+def load_prefs(uid):
+    with get_db() as db:
+        row = db.execute("SELECT prefs FROM user_prefs WHERE user_id=?", (uid,)).fetchone()
+    try:
+        data = json.loads(row["prefs"]) if row else {}
+    except (ValueError, TypeError):
+        data = {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_prefs(uid, prefs):
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO user_prefs (user_id, prefs, updated_at) VALUES (?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET prefs=excluded.prefs, updated_at=excluded.updated_at",
+            (uid, json.dumps(prefs, ensure_ascii=False), now_str()),
+        )
+
+
+def restore_prefs(uid):
+    """Nạp lại bước, kỳ làm việc và mục menu đang xem lần trước của người dùng."""
+    prefs = load_prefs(uid)
+    ok = {}
+    if prefs.get("active_step") in STEPS:
+        ok["active_step"] = prefs["active_step"]
+    p = prefs.get("period_tasks")
+    if isinstance(p, str) and re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", p):
+        ok["period_tasks"] = p
+    n = prefs.get("active_nav_choice")
+    if isinstance(n, str) and 0 < len(n) <= 300:
+        ok["active_nav_choice"] = n
+    for k, v in ok.items():
+        st.session_state.setdefault(k, v)
+    st.session_state["prefs_saved"] = ok
+
+
+def persist_prefs(uid):
+    cur = {k: st.session_state.get(k) for k in PREF_KEYS if st.session_state.get(k)}
+    if cur != st.session_state.get("prefs_saved"):
+        save_prefs(uid, cur)
+        st.session_state["prefs_saved"] = cur
+
+
 @st.cache_resource
 def init_once(schema_version=SCHEMA_VERSION):
+    existed = os.path.exists(DB_PATH)
     init_db()
     ensure_theme_config()
-    return True
+    if existed:
+        auto_backup_if_needed()
+    return {"created": not existed, "path": DB_PATH}
 
 
 # ----------------------------------------------------------------------------
@@ -1930,6 +2083,133 @@ def issue_grid(user, df, kind, mode, key):
         st.rerun()
 
 
+def issue_manage_panel(user, authored, kind, key):
+    """Nút Sửa / Xóa vấn đề do chính mình ghi nhận (dùng khi ghi sai)."""
+    uid = user["id"]
+    rows = {int(r["id"]): r for r in authored.to_dict("records")}
+    if not rows:
+        return
+    with st.expander("✏️ Sửa / 🗑️ Xóa vấn đề đã ghi (dùng khi ghi sai)", expanded=True):
+        ids = list(rows.keys())
+        sel = st.selectbox(
+            "Chọn vấn đề cần sửa hoặc xóa",
+            ids,
+            format_func=lambda i: f"#{i} · {rows[i]['client_name']} · {clean_text(rows[i]['issue'])[:70]}",
+            key=f"mng_sel_{kind}_{key}_{ver()}",
+        )
+        r = rows[sel]
+        new_issue = st.text_area("Vấn đề phát hiện", value=clean_text(r["issue"]),
+                                 key=f"mng_issue_{kind}_{sel}_{ver()}")
+        if kind == "review":
+            extra_label, extra_field = "Hướng xử lý", "solution"
+        else:
+            extra_label, extra_field = "Ghi chú chỉnh sửa", "handling_note"
+        new_extra = st.text_area(extra_label, value=clean_text(r[extra_field]),
+                                 key=f"mng_extra_{kind}_{sel}_{ver()}")
+        confirm = st.checkbox("Tôi xác nhận xóa vấn đề này", key=f"mng_confirm_{kind}_{sel}_{ver()}")
+        b1, b2, _ = st.columns([1, 1, 2])
+        if b1.button("💾 Lưu chỉnh sửa", key=f"mng_save_{kind}_{key}_{ver()}"):
+            if not new_issue.strip():
+                st.error("Nội dung vấn đề không được để trống.")
+            else:
+                with get_db() as db:
+                    row = db.execute("SELECT checker_id FROM issues WHERE id=?", (sel,)).fetchone()
+                    if row is None or row["checker_id"] != uid:
+                        st.error("Bạn chỉ được sửa vấn đề do chính mình ghi nhận.")
+                        return
+                    update_row(db, "issues", sel, {"issue": new_issue.strip(),
+                                                   extra_field: new_extra.strip(), "updated_at": now_str()})
+                log_action(user["username"], "SUA_VAN_DE", f"#{sel} ({kind})")
+                flash("success", f"Đã lưu chỉnh sửa vấn đề #{sel}.")
+                bump_ver()
+                st.rerun()
+        if b2.button("🗑️ Xóa vấn đề", key=f"mng_del_{kind}_{key}_{ver()}"):
+            if not confirm:
+                st.warning("Hãy tích ô xác nhận xóa trước khi bấm Xóa vấn đề.")
+            else:
+                with get_db() as db:
+                    row = db.execute("SELECT checker_id FROM issues WHERE id=?", (sel,)).fetchone()
+                    if row is None or row["checker_id"] != uid:
+                        st.error("Bạn chỉ được xóa vấn đề do chính mình ghi nhận.")
+                        return
+                    db.execute("DELETE FROM issues WHERE id=?", (sel,))
+                log_action(user["username"], "XOA_VAN_DE", f"#{sel} ({kind})")
+                flash("success", f"Đã xóa vấn đề #{sel}.")
+                bump_ver()
+                st.rerun()
+
+
+def pending_issues(user):
+    """Các vấn đề B4/B5 chưa xử lý xong (mọi kỳ). Nhân viên chỉ thấy vấn đề liên quan đến mình."""
+    sql = (
+        "SELECT i.*, c.code AS client_code, c.name AS client_name, a.full_name AS checker_name, "
+        "h.full_name AS handler_name FROM issues i JOIN clients c ON c.id=i.client_id "
+        "LEFT JOIN users a ON a.id=i.checker_id LEFT JOIN users h ON h.id=i.handler_id "
+        "WHERE c.active=1 AND ((i.kind='self' AND i.status<>'Đã chỉnh sửa') "
+        "OR (i.kind='review' AND i.status<>'Đã sửa xong'))"
+    )
+    params = []
+    if not is_privileged(user):
+        sql += " AND (i.handler_id=? OR i.checker_id=?)"
+        params += [user["id"], user["id"]]
+    sql += " ORDER BY i.period DESC, c.code, i.id"
+    with get_db() as db:
+        return [dict(r) for r in db.execute(sql, params).fetchall()]
+
+
+def pending_step_tasks(user, step):
+    """Số việc của bước (B4/B5) chưa hoàn thành, từ kỳ hiện tại trở về trước."""
+    limit = period_str(date.today().year, date.today().month)
+    sql = ("SELECT COUNT(*) FROM tasks t JOIN clients c ON c.id=t.client_id WHERE c.active=1 AND t.step=? "
+           "AND t.period<=? AND t.status NOT IN ('Đã hoàn thành','Không phát sinh')")
+    params = [step, limit]
+    if not is_privileged(user):
+        sql += " AND t.assignee_id=?"
+        params.append(user["id"])
+    with get_db() as db:
+        return db.execute(sql, params).fetchone()[0]
+
+
+def render_issue_overview(user):
+    """Tổng quan B4 (Tự kiểm tra) và B5 (Soát xét): người phụ trách nhìn vào là thấy ngay việc cần xử lý."""
+    st.subheader("🔍 B4 TỰ KIỂM TRA và 🛡️ B5 SOÁT XÉT: cần xử lý ngay")
+    pend = pending_issues(user)
+    for step, kind in (("B4", "self"), ("B5", "review")):
+        items = [r for r in pend if r["kind"] == kind]
+        st.markdown(step_banner_html(step), unsafe_allow_html=True)
+        n_tasks = pending_step_tasks(user, step)
+        if kind == "self":
+            c1, c2 = st.columns(2)
+            c1.metric("Việc B4 chưa hoàn thành", n_tasks)
+            c2.metric("Vấn đề chưa chỉnh sửa", len(items))
+        else:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Việc B5 chưa hoàn thành", n_tasks)
+            c2.metric("Vấn đề chưa sửa", sum(1 for r in items if r["status"] == "Chưa sửa"))
+            c3.metric("Vấn đề đang sửa", sum(1 for r in items if r["status"] == "Đang sửa"))
+        if not items:
+            st.success(f"Không còn vấn đề {step} nào cần xử lý.")
+        else:
+            icon = {"Chưa chỉnh sửa": "🔴", "Chưa sửa": "🔴", "Đang sửa": "🟠"}
+            data = {
+                "Tình trạng": [f"{icon.get(r['status'], '🟠')} {r['status']}" for r in items],
+                "Kỳ": [period_label(r["period"]) for r in items],
+                "Khách hàng": [r["client_name"] for r in items],
+                "Vấn đề phát hiện": [r["issue"] for r in items],
+            }
+            if kind == "review":
+                data["Hướng xử lý"] = [r["solution"] or "" for r in items]
+                data["Người kiểm tra"] = [r["checker_name"] or "" for r in items]
+            data["Người phụ trách xử lý"] = [r["handler_name"] or "" for r in items]
+            full_width_call(st.dataframe, pd.DataFrame(data), hide_index=True)
+        if full_width_call(st.button, f"➡️ Mở bước {step} để xử lý", key=f"dash_goto_{step}"):
+            st.session_state["active_nav_choice"] = "✅ Công việc hàng tháng"
+            st.session_state["active_step"] = step
+            if items:
+                st.session_state["period_tasks"] = items[0]["period"]
+            st.rerun()
+
+
 def render_issues(user, period, client_ids, kind):
     uid = user["id"]
     step = "B4" if kind == "self" else "B5"
@@ -2009,6 +2289,7 @@ def render_issues(user, period, client_ids, kind):
         if not mine.empty:
             st.markdown("**✏️ Vấn đề tự kiểm tra của tôi**")
             issue_grid(user, mine, "self", "owner", key)
+            issue_manage_panel(user, mine[mine["checker_id"] == uid], "self", key)
         if is_privileged(user) and not others.empty:
             with st.expander("👁️ Tự kiểm tra của người khác (chỉ xem, ô bị khóa)"):
                 issue_grid(user, others, "self", "readonly", key)
@@ -2022,6 +2303,7 @@ def render_issues(user, period, client_ids, kind):
         if not author.empty:
             st.markdown("**🔎 Vấn đề do tôi ghi nhận (người kiểm tra)**")
             issue_grid(user, author, "review", "author", key)
+            issue_manage_panel(user, author, "review", key)
         if not handler.empty:
             st.markdown("**✏️ Vấn đề cần tôi giải trình và sửa**")
             issue_grid(user, handler, "review", "handler", key)
@@ -2036,7 +2318,7 @@ def render_issues(user, period, client_ids, kind):
 # ----------------------------------------------------------------------------
 # TRANG: ĐĂNG NHẬP / ĐỔI MẬT KHẨU
 # ----------------------------------------------------------------------------
-def page_login():
+def page_login(db_info=None):
     _, mid, _ = st.columns([1, 1.6, 1])
     with mid:
         st.markdown(LOGIN_HTML, unsafe_allow_html=True)
@@ -2045,6 +2327,14 @@ def page_login():
             st.warning(msg)
         with get_db() as db:
             adm = db.execute("SELECT must_change_pw FROM users WHERE username='admin'").fetchone()
+        if db_info and db_info.get("created"):
+            with get_db() as db:
+                n_clients = db.execute("SELECT COUNT(*) FROM clients").fetchone()[0]
+            if n_clients == 0:
+                st.warning("⚠️ Hệ thống vừa tạo cơ sở dữ liệu **MỚI** (chưa có dữ liệu). Nếu bạn đã có dữ liệu trước đó, "
+                           "hãy dừng ứng dụng rồi chạy lại từ đúng thư mục chứa file `ketoan_dichvu.db`, "
+                           "hoặc đăng nhập admin và khôi phục ở mục SAO LƯU & KHÔI PHỤC. "
+                           f"File đang dùng: `{db_info['path']}`")
         if adm and adm["must_change_pw"] and not os.environ.get("ADMIN_INITIAL_PASSWORD"):
             st.info("Lần đầu sử dụng: tài khoản **admin**, mật khẩu **Admin@123**. Hệ thống sẽ yêu cầu đổi mật khẩu ngay.")
         with st.form("login_form"):
@@ -2103,6 +2393,8 @@ def page_change_password(user, forced=False):
 # ----------------------------------------------------------------------------
 def page_dashboard(user):
     st.header("📊 Tổng quan tiến độ")
+    render_issue_overview(user)
+    st.divider()
     render_alerts(user)
     st.divider()
     period = period_selector("tasks")
@@ -2581,15 +2873,99 @@ def page_audit(user):
 # ----------------------------------------------------------------------------
 # ĐIỀU HƯỚNG CHÍNH
 # ----------------------------------------------------------------------------
+def page_backup(user):
+    st.header("💾 Sao lưu và khôi phục dữ liệu")
+    with get_db() as db:
+        counts = [db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                  for t in ("users", "clients", "tasks", "issues")]
+    st.markdown("**File dữ liệu đang dùng:**")
+    st.code(DB_PATH)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Người dùng", counts[0])
+    c2.metric("Khách hàng", counts[1])
+    c3.metric("Đầu việc", counts[2])
+    c4.metric("Vấn đề B4/B5", counts[3])
+    st.caption(f"Dung lượng: {os.path.getsize(DB_PATH) / 1024:,.0f} KB. Hệ thống tự sao lưu mỗi ngày vào thư mục "
+               f"`backups` cạnh file dữ liệu (giữ {BACKUP_KEEP} bản gần nhất).")
+    st.info("Toàn bộ dữ liệu và cài đặt cá nhân nằm trong file trên. Nếu chạy trên máy chủ/đám mây có ổ đĩa tạm "
+            "(ví dụ Streamlit Community Cloud), file này sẽ bị xóa mỗi khi ứng dụng khởi động lại. "
+            "Khi đó hãy tải bản sao lưu về máy thường xuyên hoặc dùng máy chủ có ổ đĩa lưu trữ bền vững.")
+
+    b1, b2 = st.columns(2)
+    if b1.button("💾 Tạo bản sao lưu ngay"):
+        try:
+            name = os.path.basename(backup_db("thu-cong"))
+            log_action(user["username"], "SAO_LUU", name)
+            flash("success", f"Đã tạo bản sao lưu: {name}")
+        except Exception as exc:  # noqa: BLE001
+            flash("error", f"Không tạo được bản sao lưu: {exc}")
+        st.rerun()
+    b2.download_button(
+        "⬇️ Tải file dữ liệu về máy",
+        data=snapshot_bytes(),
+        file_name=f"ketoan_dichvu_{datetime.now():%Y%m%d_%H%M}.db",
+        mime="application/octet-stream",
+    )
+
+    st.subheader("Các bản sao lưu trên máy chủ")
+    backups = list_backups()
+    if not backups:
+        st.caption("Chưa có bản sao lưu nào.")
+    else:
+        full_width_call(
+            st.dataframe,
+            pd.DataFrame({"Tên file": [n for n, _ in backups], "Dung lượng (KB)": [round(s / 1024) for _, s in backups]}),
+            hide_index=True,
+        )
+
+    st.subheader("♻️ Khôi phục dữ liệu")
+    st.warning("Khôi phục sẽ ghi đè toàn bộ dữ liệu hiện tại (hệ thống tự sao lưu bản hiện tại trước khi ghi đè) "
+               "và bạn sẽ phải đăng nhập lại.")
+    names = [n for n, _ in backups]
+    src_choice = st.radio("Nguồn khôi phục", ["Bản sao lưu trên máy chủ", "Tải file .db từ máy"], horizontal=True,
+                          key=f"restore_src_{ver()}")
+    data, label = None, ""
+    if src_choice == "Bản sao lưu trên máy chủ":
+        if names:
+            pick = st.selectbox("Chọn bản sao lưu", names, key=f"restore_pick_{ver()}")
+            label = pick
+            with open(os.path.join(BACKUP_DIR, pick), "rb") as f:
+                data = f.read()
+        else:
+            st.caption("Chưa có bản sao lưu để chọn.")
+    else:
+        up = st.file_uploader("Chọn file dữ liệu (.db)", type=["db", "sqlite", "sqlite3"], key=f"restore_up_{ver()}")
+        if up is not None:
+            data, label = up.getvalue(), up.name
+    confirm = st.checkbox("Tôi hiểu dữ liệu hiện tại sẽ bị thay thế", key=f"restore_confirm_{ver()}")
+    if st.button("♻️ Khôi phục", key=f"restore_btn_{ver()}"):
+        if data is None:
+            st.error("Chưa chọn nguồn khôi phục.")
+        elif not confirm:
+            st.warning("Hãy tích ô xác nhận trước khi khôi phục.")
+        else:
+            try:
+                restore_db_from_bytes(data)
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Khôi phục thất bại, dữ liệu hiện tại được giữ nguyên: {exc}")
+            else:
+                try:
+                    log_action(user["username"], "KHOI_PHUC", label)
+                except Exception:  # noqa: BLE001
+                    pass
+                logout("Đã khôi phục dữ liệu. Vui lòng đăng nhập lại.")
+                st.rerun()
+
+
 def main():
     st.set_page_config(
         page_title="NEW VISION - Quản lý công việc kế toán", page_icon=load_page_icon(), layout="wide"
     )
     st.markdown(CSS, unsafe_allow_html=True)
-    init_once(SCHEMA_VERSION)
+    db_info = init_once(SCHEMA_VERSION)
     user = current_user()
     if user is None:
-        page_login()
+        page_login(db_info)
         return
 
     if user["must_change_pw"]:
@@ -2605,6 +2981,12 @@ def main():
         page_change_password(user, forced=True)
         return
 
+    if not st.session_state.get("prefs_loaded"):
+        restore_prefs(user["id"])  # nạp lại cài đặt cá nhân (bước, kỳ, mục menu đang xem)
+        st.session_state["prefs_loaded"] = True
+    if not st.session_state.get("backup_checked"):
+        auto_backup_if_needed()
+        st.session_state["backup_checked"] = True
     if not st.session_state.get("auto_generated"):
         auto_generate_recent(user["username"])
         st.session_state["auto_generated"] = True
@@ -2620,10 +3002,14 @@ def main():
         st.caption(f"Vai trò: {ROLES[user['role']]}")
         if alerts:
             st.write(f"🔴 {n_late} trễ hạn · 🟠 {n_soon} sắp đến hạn (B2/B3)")
+        pend_issues = pending_issues(user)
+        n_b4 = sum(1 for r in pend_issues if r["kind"] == "self")
+        if pend_issues:
+            st.write(f"🔍 B4: {n_b4} · 🛡️ B5: {len(pend_issues) - n_b4} vấn đề cần xử lý")
 
         TOP_LABEL = "📊 Tổng quan"
         PARENT_LABEL = "✅ Công việc hàng tháng"
-        reserved = {TOP_LABEL, PARENT_LABEL, "🏢 Khách hàng", "👥 Người dùng",
+        reserved = {TOP_LABEL, PARENT_LABEL, "🏢 Khách hàng", "👥 Người dùng", "💾 Sao lưu & khôi phục",
                     "⚙️ Sinh việc tự động", "📜 Nhật ký hệ thống", "🔑 Đổi mật khẩu"}
 
         # Nhãn của tất cả công ty (đầy đủ tên, không có ký hiệu mũi tên)
@@ -2676,6 +3062,7 @@ def main():
             menu_items["👥 Người dùng"] = page_users
             menu_items["⚙️ Sinh việc tự động"] = page_generate
             menu_items["📜 Nhật ký hệ thống"] = page_audit
+            menu_items["💾 Sao lưu & khôi phục"] = page_backup
         menu_items["🔑 Đổi mật khẩu"] = lambda u: page_change_password(u)
 
         options = list(menu_items.keys())
@@ -2733,6 +3120,7 @@ def main():
     st.markdown(HERO_HTML, unsafe_allow_html=True)
     show_flash()
     menu_items[choice](user)
+    persist_prefs(user["id"])  # lưu cài đặt cá nhân để lần đăng nhập sau còn nguyên
 
 
 main()
