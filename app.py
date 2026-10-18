@@ -70,7 +70,7 @@ SESSION_TIMEOUT_MIN = 30
 MAX_FAILED_ATTEMPTS = 5
 LOCK_MINUTES = 15
 PBKDF2_ITERATIONS = 200_000
-SCHEMA_VERSION = 5  # tăng khi đổi cấu trúc DB để nâng cấp chạy lại (init_once được cache)
+SCHEMA_VERSION = 6  # tăng khi đổi cấu trúc DB để nâng cấp chạy lại (init_once được cache)
 WARN_DAYS = 5  # cảnh báo "sắp đến hạn" khi còn <= số ngày này
 
 ROLES = {
@@ -254,7 +254,8 @@ CREATE TABLE IF NOT EXISTS clients (
     staff_id INTEGER REFERENCES users(id),
     reviewer_id INTEGER REFERENCES users(id),
     active INTEGER NOT NULL DEFAULT 1,
-    note TEXT DEFAULT ''
+    note TEXT DEFAULT '',
+    start_date TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS client_taxes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -519,6 +520,9 @@ def init_db():
             "SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'"
         ).fetchone() is not None
         db.executescript(SCHEMA)
+        client_cols = [r["name"] for r in db.execute("PRAGMA table_info(clients)").fetchall()]
+        if "start_date" not in client_cols:  # nâng cấp: ngày bắt đầu thực hiện của khách hàng
+            db.execute("ALTER TABLE clients ADD COLUMN start_date TEXT DEFAULT ''")
         # Nâng cấp các việc Lưu trữ hồ sơ từ B6 sang B7
         db.execute("UPDATE OR IGNORE tasks SET step='B7' WHERE step='B6' AND sub_item LIKE '%Lưu trữ%'")
         # Dòng B6 "Lưu trữ" còn sót (đã có dòng B7 trùng khóa): gộp dữ liệu sang B7 rồi xóa
@@ -636,15 +640,39 @@ CLOUD_DDL = (
 )
 
 
+def _scan_url(obj, depth=0):
+    """Tìm chuỗi kết nối Postgres trong Secrets (kể cả khi người dùng đặt trong một mục [..])."""
+    if isinstance(obj, str):
+        return obj if obj.strip().lower().startswith(("postgres://", "postgresql://")) else ""
+    if depth < 3 and hasattr(obj, "keys"):
+        for k in list(obj.keys()):
+            try:
+                found = _scan_url(obj[k], depth + 1)
+            except Exception:  # noqa: BLE001
+                found = ""
+            if found:
+                return found
+    return ""
+
+
+def secret_key_names():
+    """Chỉ tên các khóa trong Secrets (không lấy giá trị) để chẩn đoán khi chưa bật được cloud."""
+    try:
+        return sorted(str(k) for k in st.secrets.keys())
+    except Exception:  # noqa: BLE001
+        return []
+
+
 @st.cache_resource
 def sync_state():
     url = os.environ.get("DATABASE_URL", "")
     if not url:
         try:
-            url = st.secrets.get("DATABASE_URL", "") or ""
+            url = str(st.secrets.get("DATABASE_URL", "") or "") or _scan_url(st.secrets)
         except Exception:  # noqa: BLE001  (chưa có file secrets)
             url = ""
-    return {"url": str(url).strip(), "lock": threading.Lock(), "timer": None, "due": 0.0,
+    url = str(url).strip().strip("\"'“”‘’ ")
+    return {"url": url, "lock": threading.Lock(), "timer": None, "due": 0.0,
             "dirty": False, "ready": False, "last_ok": "", "last_error": ""}
 
 
@@ -1395,13 +1423,20 @@ def due_date_for(step, tax_type, freq, y, m):
     return date(ny, nm, last_day(ny, nm))
 
 
-def generate_tasks(year, month, actor):
-    """Sinh việc cho mọi khách hàng đang hoạt động. Không tạo trùng. Trả về số việc mới."""
+def generate_tasks(year, month, actor, client_id=None):
+    """Sinh việc cho mọi khách hàng đang hoạt động (hoặc một khách hàng). Không tạo trùng.
+    Chỉ giao việc từ tháng bắt đầu thực hiện của khách hàng trở đi. Trả về số việc mới."""
     period = period_str(year, month)
     inserted = 0
     with get_db() as db:
-        clients = db.execute("SELECT * FROM clients WHERE active=1").fetchall()
+        if client_id is None:
+            clients = db.execute("SELECT * FROM clients WHERE active=1").fetchall()
+        else:
+            clients = db.execute("SELECT * FROM clients WHERE active=1 AND id=?", (client_id,)).fetchall()
         for c in clients:
+            start_period = (c["start_date"] or "")[:7]
+            if start_period and period < start_period:
+                continue  # chưa đến tháng bắt đầu: không giao việc
             staff, reviewer = c["staff_id"], c["reviewer_id"]
             taxes = db.execute(
                 "SELECT tax_type, frequency FROM client_taxes WHERE client_id=?", (c["id"],)
@@ -2763,6 +2798,50 @@ def page_tasks(user, selected_client_id=None):
 # ----------------------------------------------------------------------------
 # TRANG: KHÁCH HÀNG (ADMIN)
 # ----------------------------------------------------------------------------
+def fmt_date_vn(s):
+    s = clean_text(s)[:10]
+    try:
+        return date.fromisoformat(s).strftime("%d/%m/%Y") if s else ""
+    except ValueError:
+        return ""
+
+
+def generate_client_from_start(client_id, actor, max_months=60):
+    """Giao việc cho một khách hàng từ tháng bắt đầu đến tháng hiện tại (không tạo trùng)."""
+    with get_db() as db:
+        c = db.execute("SELECT start_date, active FROM clients WHERE id=?", (client_id,)).fetchone()
+    if not c or not c["active"]:
+        return 0
+    today = date.today()
+    sd = (c["start_date"] or "")[:7]
+    if re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", sd):
+        y, m = int(sd[:4]), int(sd[5:7])
+    else:  # chưa đặt ngày bắt đầu: chỉ sinh kỳ trước
+        y, m = add_month(today.year, today.month, -1)
+    total, n = 0, 0
+    while (y, m) <= (today.year, today.month) and n < max_months:
+        total += generate_tasks(y, m, actor, client_id)
+        y, m = add_month(y, m, 1)
+        n += 1
+    return total
+
+
+def purge_untouched_before_start(client_id, start_period):
+    """Xóa các việc còn trống (chưa ai cập nhật) của những kỳ trước tháng bắt đầu. Việc đã có dữ liệu được giữ lại."""
+    with get_db() as db:
+        cur = db.execute(
+            "DELETE FROM tasks WHERE client_id=? AND period<? AND status='Chưa thực hiện' "
+            "AND COALESCE(note,'')='' AND COALESCE(completed_date,'')='' AND tax_amount IS NULL "
+            "AND paid_amount IS NULL AND COALESCE(check_note,'')='' "
+            "AND COALESCE(check_status,'Chưa kiểm tra')='Chưa kiểm tra' AND COALESCE(receipt_no,'')='' "
+            "AND COALESCE(paid_date,'')='' AND COALESCE(archive_loc,'')='' "
+            "AND COALESCE(file_status,'Chưa nộp')='Chưa nộp' "
+            "AND NOT EXISTS (SELECT 1 FROM issues i WHERE i.client_id=tasks.client_id AND i.period=tasks.period)",
+            (client_id, start_period),
+        )
+        return cur.rowcount
+
+
 def page_clients(user):
     st.header("🏢 Quản lý khách hàng")
     users = load_users(active_only=True)
@@ -2774,37 +2853,67 @@ def page_clients(user):
         return "— Chưa chọn —" if i == 0 else user_label(umap[i])
 
     with st.expander("➕ Thêm khách hàng mới", expanded=False):
-        with st.form("add_client", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            code = c1.text_input("Mã khách hàng *")
-            name = c2.text_input("Tên khách hàng *")
-            mst = c1.text_input("Mã số thuế")
-            staff = c2.selectbox("Nhân viên phụ trách", [0] + list(umap.keys()), format_func=ulabel)
-            reviewer = c1.selectbox("Người kiểm tra (soát xét, kiểm tra lưu trữ)", [0] + reviewer_ids, format_func=ulabel)
-            taxes = st.multiselect(
-                "Sắc thuế phải kê khai (tần suất mặc định, chỉnh sau ở bảng bên dưới)",
-                TAX_TYPES, default=["GTGT", "TNCN", "TNDN"],
-            )
-            submitted = st.form_submit_button("Thêm khách hàng")
-        if submitted:
+        v = ver()
+        c1, c2 = st.columns(2)
+        code = c1.text_input("Mã khách hàng *", key=f"nc_code_{v}")
+        name = c2.text_input("Tên khách hàng *", key=f"nc_name_{v}")
+        mst = c1.text_input("Mã số thuế", key=f"nc_mst_{v}")
+        start = c2.date_input("Ngày bắt đầu thực hiện *", value=date.today(), format="DD/MM/YYYY",
+                              key=f"nc_start_{v}")
+        staff = c1.selectbox("Nhân viên phụ trách", [0] + list(umap.keys()), format_func=ulabel, key=f"nc_staff_{v}")
+        reviewer = c2.selectbox("Người kiểm tra (soát xét, kiểm tra lưu trữ)", [0] + reviewer_ids,
+                                format_func=ulabel, key=f"nc_rev_{v}")
+        st.markdown("**Sắc thuế và kỳ kê khai**")
+        st.caption("Tháng: sinh việc mọi tháng. Quý: sinh việc tại tháng 3, 6, 9, 12. Năm: sinh việc tại tháng 12. "
+                   "Bấm dấu + cuối bảng để thêm dòng; một sắc thuế có thể có nhiều dòng (ví dụ TNDN: Quý và Năm).")
+        default_taxes = pd.DataFrame(
+            [{"Sắc thuế": "GTGT", "Kỳ kê khai": "Tháng"},
+             {"Sắc thuế": "TNCN", "Kỳ kê khai": "Tháng"},
+             {"Sắc thuế": "TNDN", "Kỳ kê khai": "Quý"}],
+            columns=["Sắc thuế", "Kỳ kê khai"],
+        )
+        tax_edit = full_width_call(
+            st.data_editor,
+            default_taxes,
+            key=f"nc_tax_{v}",
+            num_rows="dynamic",
+            hide_index=True,
+            column_config={
+                "Sắc thuế": st.column_config.SelectboxColumn("Sắc thuế", options=TAX_TYPES, required=True),
+                "Kỳ kê khai": st.column_config.SelectboxColumn("Kỳ kê khai", options=FREQUENCIES, required=True),
+            },
+        )
+        gen_now = st.checkbox("Giao việc ngay từ tháng bắt đầu đến tháng hiện tại", value=True, key=f"nc_gen_{v}")
+        if st.button("➕ Thêm khách hàng", key=f"nc_btn_{v}"):
+            pairs = []
+            for _, r in tax_edit.iterrows():
+                tt, fq = clean_text(r["Sắc thuế"]), clean_text(r["Kỳ kê khai"])
+                if tt in TAX_TYPES and fq in FREQUENCIES and (tt, fq) not in pairs:
+                    pairs.append((tt, fq))
             if not code.strip() or not name.strip():
                 st.error("Mã và tên khách hàng là bắt buộc.")
+            elif start is None:
+                st.error("Vui lòng chọn ngày bắt đầu thực hiện.")
             else:
                 try:
                     with get_db() as db:
                         cur = db.execute(
-                            "INSERT INTO clients (code, name, tax_code, staff_id, reviewer_id, active) "
-                            "VALUES (?,?,?,?,?,1)",
-                            (code.strip(), name.strip(), mst.strip(), staff or None, reviewer or None),
+                            "INSERT INTO clients (code, name, tax_code, staff_id, reviewer_id, active, start_date) "
+                            "VALUES (?,?,?,?,?,1,?)",
+                            (code.strip(), name.strip(), mst.strip(), staff or None, reviewer or None,
+                             start.isoformat()),
                         )
                         cid = cur.lastrowid
-                        for t in taxes:
+                        for tt, fq in pairs:
                             db.execute(
                                 "INSERT OR IGNORE INTO client_taxes (client_id, tax_type, frequency) VALUES (?,?,?)",
-                                (cid, t, DEFAULT_FREQ.get(t, "Tháng")),
+                                (cid, tt, fq),
                             )
-                    log_action(user["username"], "THEM_KHACH_HANG", code.strip())
-                    flash("success", f"Đã thêm khách hàng {code.strip()}.")
+                    log_action(user["username"], "THEM_KHACH_HANG", f"{code.strip()} (bắt đầu {start.isoformat()})")
+                    n_new = generate_client_from_start(cid, user["username"]) if gen_now else 0
+                    flash("success", f"Đã thêm khách hàng {code.strip()} (bắt đầu từ {start.strftime('%d/%m/%Y')}, "
+                                     f"{len(pairs)} dòng sắc thuế)" + (f"; đã giao {n_new} đầu việc." if gen_now else "."))
+                    bump_ver()
                     st.rerun()
                 except sqlite3.IntegrityError:
                     st.error("Mã khách hàng đã tồn tại.")
@@ -2821,6 +2930,7 @@ def page_clients(user):
                 "Mã": [c["code"] for c in clients],
                 "Tên": [c["name"] for c in clients],
                 "MST": [c["tax_code"] for c in clients],
+                "Ngày bắt đầu": [fmt_date_vn(c.get("start_date")) or "(chưa đặt)" for c in clients],
                 "NV phụ trách": [c["staff_name"] or "" for c in clients],
                 "Người kiểm tra": [c["reviewer_name"] or "" for c in clients],
                 "Hoạt động": ["Có" if c["active"] else "Không" for c in clients],
@@ -2848,6 +2958,13 @@ def page_clients(user):
                              index=staff_opts.index(c["staff_id"] or 0), format_func=ulabel)
         reviewer = e2.selectbox("Người kiểm tra", rev_opts,
                                 index=rev_opts.index(c["reviewer_id"] or 0), format_func=ulabel)
+        try:
+            sd_val = date.fromisoformat(clean_text(c.get("start_date"))[:10])
+        except ValueError:
+            sd_val = None
+        has_start = e1.checkbox("Đặt ngày bắt đầu thực hiện", value=sd_val is not None)
+        start = e2.date_input("Ngày bắt đầu thực hiện", value=sd_val or date.today(), format="DD/MM/YYYY")
+        purge = st.checkbox("Dọn các việc còn trống của những kỳ trước tháng bắt đầu", value=True)
         active = st.checkbox("Đang hoạt động (được sinh việc hàng tháng)", value=bool(c["active"]))
         note = st.text_area("Ghi chú", value=c["note"] or "")
         saved = st.form_submit_button("Lưu thông tin khách hàng")
@@ -2855,18 +2972,23 @@ def page_clients(user):
         if not name.strip():
             st.error("Tên khách hàng không được để trống.")
         else:
+            start_iso = start.isoformat() if has_start and start else ""
             with get_db() as db:
                 db.execute(
-                    "UPDATE clients SET name=?, tax_code=?, staff_id=?, reviewer_id=?, active=?, note=? WHERE id=?",
+                    "UPDATE clients SET name=?, tax_code=?, staff_id=?, reviewer_id=?, active=?, note=?, "
+                    "start_date=? WHERE id=?",
                     (name.strip(), mst.strip(), staff or None, reviewer or None,
-                     1 if active else 0, note.strip(), sel),
+                     1 if active else 0, note.strip(), start_iso, sel),
                 )
-            log_action(user["username"], "SUA_KHACH_HANG", c["code"])
-            flash("success", "Đã cập nhật khách hàng. Dùng 'Đồng bộ người phụ trách' ở mục Sinh việc nếu cần áp dụng cho việc đã sinh.")
+            log_action(user["username"], "SUA_KHACH_HANG", f"{c['code']} (bắt đầu {start_iso or 'chưa đặt'})")
+            n_del = purge_untouched_before_start(sel, start_iso[:7]) if (start_iso and purge) else 0
+            n_new = generate_client_from_start(sel, user["username"]) if active else 0
+            flash("success", f"Đã cập nhật khách hàng. Giao thêm {n_new} đầu việc, dọn {n_del} việc trống trước tháng bắt đầu. "
+                             "Dùng 'Đồng bộ người phụ trách' ở mục Sinh việc nếu cần áp dụng người phụ trách mới cho việc đã sinh.")
             bump_ver()
             st.rerun()
 
-    st.subheader(f"Sắc thuế và tần suất kê khai của {c['code']}")
+    st.subheader(f"Sắc thuế và kỳ kê khai của {c['code']}")
     st.caption("Tháng: sinh việc mọi tháng. Quý: sinh việc tại tháng 3, 6, 9, 12. Năm: sinh việc tại tháng 12. "
                "Một sắc thuế có thể có nhiều dòng (ví dụ TNDN: Quý và Năm).")
     with get_db() as db:
@@ -2874,8 +2996,8 @@ def page_clients(user):
             "SELECT tax_type, frequency FROM client_taxes WHERE client_id=? ORDER BY id", (sel,)
         ).fetchall()
     tdf = pd.DataFrame(
-        [{"Sắc thuế": r["tax_type"], "Tần suất": r["frequency"]} for r in trows],
-        columns=["Sắc thuế", "Tần suất"],
+        [{"Sắc thuế": r["tax_type"], "Kỳ kê khai": r["frequency"]} for r in trows],
+        columns=["Sắc thuế", "Kỳ kê khai"],
     )
     tedit = full_width_call(
         st.data_editor,
@@ -2885,13 +3007,13 @@ def page_clients(user):
         hide_index=True,
         column_config={
             "Sắc thuế": st.column_config.SelectboxColumn("Sắc thuế", options=TAX_TYPES, required=True),
-            "Tần suất": st.column_config.SelectboxColumn("Tần suất", options=FREQUENCIES, required=True),
+            "Kỳ kê khai": st.column_config.SelectboxColumn("Kỳ kê khai", options=FREQUENCIES, required=True),
         },
     )
     if st.button("💾 Lưu cấu hình sắc thuế", key=f"save_tax_{sel}_{ver()}"):
         pairs = []
         for _, r in tedit.iterrows():
-            tt, fq = clean_text(r["Sắc thuế"]), clean_text(r["Tần suất"])
+            tt, fq = clean_text(r["Sắc thuế"]), clean_text(r["Kỳ kê khai"])
             if tt in TAX_TYPES and fq in FREQUENCIES and (tt, fq) not in pairs:
                 pairs.append((tt, fq))
         with get_db() as db:
@@ -2902,7 +3024,8 @@ def page_clients(user):
                     (sel, tt, fq),
                 )
         log_action(user["username"], "SUA_SAC_THUE", f"{c['code']}: {len(pairs)} dòng")
-        flash("success", "Đã lưu cấu hình sắc thuế (áp dụng cho các kỳ sinh việc sau này).")
+        n_new = generate_client_from_start(sel, user["username"]) if c["active"] else 0
+        flash("success", f"Đã lưu cấu hình sắc thuế; giao thêm {n_new} đầu việc (từ tháng bắt đầu đến hiện tại).")
         bump_ver()
         st.rerun()
 
@@ -3120,6 +3243,9 @@ def page_backup(user):
         st.warning("Chưa bật đồng bộ cloud: dữ liệu chỉ nằm trong file trên. Nếu chạy trên máy chủ/đám mây có ổ đĩa tạm "
                    "(ví dụ Streamlit Community Cloud), file này sẽ bị xóa mỗi khi ứng dụng khởi động lại. "
                    "Hãy thêm DATABASE_URL (xem hướng dẫn Neon) hoặc tải bản sao lưu về máy thường xuyên.")
+        names = secret_key_names()
+        st.caption("Các khóa hệ thống đang đọc được trong Secrets: " + (", ".join(names) if names else "(không có khóa nào)")
+                   + ". Cần có khóa tên DATABASE_URL. Sau khi sửa Secrets hãy Reboot app.")
 
     b1, b2 = st.columns(2)
     if b1.button("💾 Tạo bản sao lưu ngay"):
