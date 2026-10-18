@@ -39,6 +39,8 @@ import os
 import re
 import sqlite3
 import tempfile
+import threading
+import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 
@@ -469,18 +471,25 @@ def load_page_icon():
 # CƠ SỞ DỮ LIỆU
 # ----------------------------------------------------------------------------
 @contextmanager
-def get_db():
+def get_db(quiet=False):
+    """Mở kết nối SQLite. Nếu có thay đổi dữ liệu và đang bật đồng bộ cloud thì lên lịch đẩy lên cloud.
+    quiet=True dùng cho thay đổi ít quan trọng (nhật ký, cài đặt cá nhân): đồng bộ chậm hơn để tiết kiệm."""
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    before = conn.total_changes
+    changed = False
     try:
         yield conn
         conn.commit()
+        changed = conn.total_changes != before
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+    if changed:
+        mark_dirty(SYNC_QUIET_SEC if quiet else None)
 
 
 def now_str():
@@ -488,7 +497,7 @@ def now_str():
 
 
 def log_action(username, action, detail=""):
-    with get_db() as db:
+    with get_db(quiet=True) as db:
         db.execute(
             "INSERT INTO audit_log (ts, username, action, detail) VALUES (?,?,?,?)",
             (now_str(), username, action, detail),
@@ -611,6 +620,199 @@ def ensure_theme_config():
         pass
 
 
+# ----------------------------------------------------------------------------
+# ĐỒNG BỘ DỮ LIỆU LÊN CLOUD (Neon / Supabase Postgres) - để dữ liệu không mất khi app khởi động lại
+# Cách hoạt động: app vẫn dùng file SQLite; mỗi khi có thay đổi, bản chụp file được đẩy lên cơ sở dữ liệu
+# online (sau vài giây). Khi app khởi động, bản mới nhất được tải về. Bật bằng biến DATABASE_URL
+# (Streamlit Secrets hoặc biến môi trường). Không có DATABASE_URL thì chạy bình thường chỉ với file local.
+# ----------------------------------------------------------------------------
+SYNC_DELAY_SEC = 5      # thay đổi thông thường: đẩy lên cloud sau ~5 giây (gom nhiều thay đổi một lần)
+SYNC_QUIET_SEC = 60     # thay đổi ít quan trọng (nhật ký, cài đặt cá nhân)
+CLOUD_DAILY_KEEP = 14   # số bản chụp theo ngày giữ lại trên cloud
+CLOUD_DDL = (
+    "CREATE TABLE IF NOT EXISTS app_db_snapshot ("
+    "slot TEXT PRIMARY KEY, data BYTEA NOT NULL, size_bytes INTEGER NOT NULL DEFAULT 0, "
+    "updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+)
+
+
+@st.cache_resource
+def sync_state():
+    url = os.environ.get("DATABASE_URL", "")
+    if not url:
+        try:
+            url = st.secrets.get("DATABASE_URL", "") or ""
+        except Exception:  # noqa: BLE001  (chưa có file secrets)
+            url = ""
+    return {"url": str(url).strip(), "lock": threading.Lock(), "timer": None, "due": 0.0,
+            "dirty": False, "ready": False, "last_ok": "", "last_error": ""}
+
+
+def cloud_enabled():
+    return bool(sync_state()["url"])
+
+
+def _pg_connect(url):
+    import psycopg2  # chỉ cần khi bật đồng bộ cloud
+    last = None
+    for _ in range(3):  # Neon có thể cần vài giây để "thức dậy" sau khi nghỉ
+        try:
+            return psycopg2.connect(url, connect_timeout=15)
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            time.sleep(2)
+    raise last
+
+
+def remote_ping(url):
+    conn = _pg_connect(url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            return cur.fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def remote_fetch(url, slot="current"):
+    conn = _pg_connect(url)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(CLOUD_DDL)
+                cur.execute("SELECT data FROM app_db_snapshot WHERE slot = %s", (slot,))
+                row = cur.fetchone()
+        return bytes(row[0]) if row else None
+    finally:
+        conn.close()
+
+
+def remote_list(url):
+    conn = _pg_connect(url)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(CLOUD_DDL)
+                cur.execute(
+                    "SELECT slot, size_bytes, to_char(updated_at AT TIME ZONE 'Asia/Ho_Chi_Minh', "
+                    "'YYYY-MM-DD HH24:MI:SS') FROM app_db_snapshot ORDER BY slot DESC"
+                )
+                return [(r[0], r[1], r[2]) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def remote_push(url, data):
+    import psycopg2
+    slots = ["current", f"daily_{datetime.now():%Y%m%d}"]
+    conn = _pg_connect(url)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(CLOUD_DDL)
+                for slot in slots:
+                    cur.execute(
+                        "INSERT INTO app_db_snapshot (slot, data, size_bytes, updated_at) "
+                        "VALUES (%s, %s, %s, now()) ON CONFLICT (slot) DO UPDATE SET "
+                        "data = EXCLUDED.data, size_bytes = EXCLUDED.size_bytes, updated_at = now()",
+                        (slot, psycopg2.Binary(data), len(data)),
+                    )
+                cur.execute(
+                    "DELETE FROM app_db_snapshot WHERE left(slot, 6) = 'daily_' AND slot NOT IN "
+                    "(SELECT slot FROM app_db_snapshot WHERE left(slot, 6) = 'daily_' "
+                    "ORDER BY slot DESC LIMIT %s)",
+                    (CLOUD_DAILY_KEEP,),
+                )
+    finally:
+        conn.close()
+
+
+def _schedule(state, delay):
+    with state["lock"]:
+        state["dirty"] = True
+        due = time.time() + delay
+        if state["timer"] is not None:
+            if state["due"] <= due:
+                return
+            state["timer"].cancel()
+        t = threading.Timer(delay, _do_flush, args=(state, False, False))
+        t.daemon = True
+        state["timer"], state["due"] = t, due
+        t.start()
+
+
+def _do_flush(state, raise_errors=False, force=False):
+    with state["lock"]:
+        state["timer"] = None
+        if not state["dirty"] and not force:
+            return
+        state["dirty"] = False
+    try:
+        remote_push(state["url"], snapshot_bytes())
+        state["last_ok"], state["last_error"] = now_str(), ""
+    except Exception as exc:  # noqa: BLE001
+        state["last_error"] = f"{type(exc).__name__}: {exc}"
+        if raise_errors:
+            with state["lock"]:
+                state["dirty"] = True
+            raise
+        _schedule(state, 30)  # thử lại sau 30 giây, dữ liệu vẫn an toàn trong file local
+
+
+def mark_dirty(delay=None):
+    state = sync_state()
+    if not state["url"] or not state["ready"]:
+        return
+    _schedule(state, SYNC_DELAY_SEC if delay is None else delay)
+
+
+def flush_now():
+    """Đẩy ngay lên cloud (dùng sau khi khôi phục). Lỗi sẽ được ném ra để báo cho người dùng."""
+    state = sync_state()
+    if not state["url"] or not state["ready"]:
+        return
+    with state["lock"]:
+        if state["timer"] is not None:
+            state["timer"].cancel()
+            state["timer"] = None
+    _do_flush(state, raise_errors=True, force=True)
+
+
+def _write_db_bytes(data):
+    if not data.startswith(b"SQLite format 3\x00"):
+        raise ValueError("Dữ liệu tải từ cloud không phải file SQLite hợp lệ.")
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+    tmp = DB_PATH + ".incoming"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    for ext in ("-wal", "-shm"):
+        try:
+            os.remove(DB_PATH + ext)
+        except OSError:
+            pass
+    os.replace(tmp, DB_PATH)
+
+
+@st.cache_resource
+def startup_sync():
+    """Chạy một lần mỗi lần ứng dụng khởi động: lấy dữ liệu mới nhất từ cloud về máy chủ app.
+    Nếu không kết nối được thì báo lỗi và DỪNG, để không tạo CSDL trống rồi ghi đè lên dữ liệu trên cloud."""
+    state = sync_state()
+    if not state["url"]:
+        return {"cloud": False}
+    data = remote_fetch(state["url"])
+    info = {"cloud": True, "restored": False, "uploaded_local": False}
+    if data:
+        _write_db_bytes(data)
+        info["restored"] = True
+    elif os.path.exists(DB_PATH):
+        info["uploaded_local"] = True  # cloud còn trống nhưng máy đã có dữ liệu: đẩy lên lần đầu
+    state["ready"] = True
+    if info["uploaded_local"]:
+        mark_dirty(1)
+    return info
+
+
 def backup_db(tag="tu-dong"):
     """Sao lưu an toàn bằng API backup của SQLite; chỉ giữ BACKUP_KEEP bản gần nhất."""
     os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -693,6 +895,7 @@ def restore_db_from_bytes(data):
         except OSError:
             pass
     init_db()  # nâng cấp cấu trúc nếu bản sao lưu từ phiên bản cũ
+    flush_now()  # nếu bật cloud: đẩy ngay dữ liệu vừa khôi phục lên cloud
 
 
 PREF_KEYS = ("active_step", "period_tasks", "active_nav_choice")
@@ -709,7 +912,7 @@ def load_prefs(uid):
 
 
 def save_prefs(uid, prefs):
-    with get_db() as db:
+    with get_db(quiet=True) as db:
         db.execute(
             "INSERT INTO user_prefs (user_id, prefs, updated_at) VALUES (?,?,?) "
             "ON CONFLICT(user_id) DO UPDATE SET prefs=excluded.prefs, updated_at=excluded.updated_at",
@@ -743,12 +946,14 @@ def persist_prefs(uid):
 
 @st.cache_resource
 def init_once(schema_version=SCHEMA_VERSION):
+    cloud_info = startup_sync()  # tải dữ liệu từ cloud (nếu bật) TRƯỚC khi mở/tạo file dữ liệu
     existed = os.path.exists(DB_PATH)
     init_db()
     ensure_theme_config()
     if existed:
         auto_backup_if_needed()
-    return {"created": not existed, "path": DB_PATH}
+    return {"created": not existed, "path": DB_PATH, "cloud": cloud_info.get("cloud", False),
+            "restored": cloud_info.get("restored", False)}
 
 
 # ----------------------------------------------------------------------------
@@ -2330,7 +2535,9 @@ def page_login(db_info=None):
         if db_info and db_info.get("created"):
             with get_db() as db:
                 n_clients = db.execute("SELECT COUNT(*) FROM clients").fetchone()[0]
-            if n_clients == 0:
+            if n_clients == 0 and db_info.get("cloud"):
+                st.info("Cơ sở dữ liệu online còn trống nên hệ thống khởi tạo mới. Từ giờ dữ liệu được tự động lưu lên cloud.")
+            elif n_clients == 0:
                 st.warning("⚠️ Hệ thống vừa tạo cơ sở dữ liệu **MỚI** (chưa có dữ liệu). Nếu bạn đã có dữ liệu trước đó, "
                            "hãy dừng ứng dụng rồi chạy lại từ đúng thư mục chứa file `ketoan_dichvu.db`, "
                            "hoặc đăng nhập admin và khôi phục ở mục SAO LƯU & KHÔI PHỤC. "
@@ -2887,9 +3094,32 @@ def page_backup(user):
     c4.metric("Vấn đề B4/B5", counts[3])
     st.caption(f"Dung lượng: {os.path.getsize(DB_PATH) / 1024:,.0f} KB. Hệ thống tự sao lưu mỗi ngày vào thư mục "
                f"`backups` cạnh file dữ liệu (giữ {BACKUP_KEEP} bản gần nhất).")
-    st.info("Toàn bộ dữ liệu và cài đặt cá nhân nằm trong file trên. Nếu chạy trên máy chủ/đám mây có ổ đĩa tạm "
-            "(ví dụ Streamlit Community Cloud), file này sẽ bị xóa mỗi khi ứng dụng khởi động lại. "
-            "Khi đó hãy tải bản sao lưu về máy thường xuyên hoặc dùng máy chủ có ổ đĩa lưu trữ bền vững.")
+    if cloud_enabled():
+        state = sync_state()
+        st.success("☁️ Đang bật đồng bộ lên cơ sở dữ liệu online: dữ liệu được tự động lưu lên cloud sau mỗi thay đổi "
+                   "(chậm vài giây) và tự nạp lại khi ứng dụng khởi động lại.")
+        st.caption(f"Lần đồng bộ thành công gần nhất: {state['last_ok'] or 'chưa có trong phiên chạy này'}")
+        if state["last_error"]:
+            st.error(f"Lần đồng bộ gần nhất bị lỗi (hệ thống sẽ tự thử lại): {state['last_error']}")
+        k1, k2 = st.columns(2)
+        if k1.button("☁️ Đồng bộ lên cloud ngay"):
+            try:
+                flush_now()
+                flash("success", "Đã đồng bộ dữ liệu lên cloud.")
+            except Exception as exc:  # noqa: BLE001
+                flash("error", f"Đồng bộ thất bại: {exc}")
+            st.rerun()
+        if k2.button("🔌 Kiểm tra kết nối cloud"):
+            try:
+                ok = remote_ping(state["url"])
+                flash("success" if ok else "error", "Kết nối cloud thành công." if ok else "Cloud không phản hồi đúng.")
+            except Exception as exc:  # noqa: BLE001
+                flash("error", f"Không kết nối được cloud: {exc}")
+            st.rerun()
+    else:
+        st.warning("Chưa bật đồng bộ cloud: dữ liệu chỉ nằm trong file trên. Nếu chạy trên máy chủ/đám mây có ổ đĩa tạm "
+                   "(ví dụ Streamlit Community Cloud), file này sẽ bị xóa mỗi khi ứng dụng khởi động lại. "
+                   "Hãy thêm DATABASE_URL (xem hướng dẫn Neon) hoặc tải bản sao lưu về máy thường xuyên.")
 
     b1, b2 = st.columns(2)
     if b1.button("💾 Tạo bản sao lưu ngay"):
@@ -2922,8 +3152,9 @@ def page_backup(user):
     st.warning("Khôi phục sẽ ghi đè toàn bộ dữ liệu hiện tại (hệ thống tự sao lưu bản hiện tại trước khi ghi đè) "
                "và bạn sẽ phải đăng nhập lại.")
     names = [n for n, _ in backups]
-    src_choice = st.radio("Nguồn khôi phục", ["Bản sao lưu trên máy chủ", "Tải file .db từ máy"], horizontal=True,
-                          key=f"restore_src_{ver()}")
+    CLOUD_SRC = "Bản sao lưu theo ngày trên cloud"
+    sources = ["Bản sao lưu trên máy chủ", "Tải file .db từ máy"] + ([CLOUD_SRC] if cloud_enabled() else [])
+    src_choice = st.radio("Nguồn khôi phục", sources, horizontal=True, key=f"restore_src_{ver()}")
     data, label = None, ""
     if src_choice == "Bản sao lưu trên máy chủ":
         if names:
@@ -2933,6 +3164,22 @@ def page_backup(user):
                 data = f.read()
         else:
             st.caption("Chưa có bản sao lưu để chọn.")
+    elif src_choice == CLOUD_SRC:
+        try:
+            slots = remote_list(sync_state()["url"])
+        except Exception as exc:  # noqa: BLE001
+            slots = []
+            st.error(f"Không đọc được danh sách trên cloud: {exc}")
+        if slots:
+            slot_pick = st.selectbox("Chọn bản trên cloud", [s[0] for s in slots],
+                                     format_func=lambda s: next(f"{x[0]} · cập nhật {x[2]} · {x[1] // 1024} KB" for x in slots if x[0] == s),
+                                     key=f"restore_cloud_{ver()}")
+            try:
+                data, label = remote_fetch(sync_state()["url"], slot_pick), f"cloud:{slot_pick}"
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Không tải được bản này: {exc}")
+        else:
+            st.caption("Chưa có bản nào trên cloud.")
     else:
         up = st.file_uploader("Chọn file dữ liệu (.db)", type=["db", "sqlite", "sqlite3"], key=f"restore_up_{ver()}")
         if up is not None:
@@ -2962,7 +3209,15 @@ def main():
         page_title="NEW VISION - Quản lý công việc kế toán", page_icon=load_page_icon(), layout="wide"
     )
     st.markdown(CSS, unsafe_allow_html=True)
-    db_info = init_once(SCHEMA_VERSION)
+    try:
+        db_info = init_once(SCHEMA_VERSION)
+    except Exception as exc:  # noqa: BLE001
+        st.markdown(HERO_HTML, unsafe_allow_html=True)
+        st.error("Không kết nối được cơ sở dữ liệu online (Neon/Postgres) để nạp dữ liệu. "
+                 "Ứng dụng tạm dừng để tránh ghi đè lên dữ liệu đang có. Hãy kiểm tra DATABASE_URL trong "
+                 "Secrets, rồi tải lại trang.")
+        st.code(f"{type(exc).__name__}: {exc}")
+        st.stop()
     user = current_user()
     if user is None:
         page_login(db_info)

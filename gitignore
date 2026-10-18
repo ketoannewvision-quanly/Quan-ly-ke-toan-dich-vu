@@ -1,0 +1,12 @@
+# Dữ liệu và sao lưu: KHÔNG đưa lên GitHub (chứa dữ liệu khách hàng, mật khẩu đã mã hóa)
+*.db
+*.db-wal
+*.db-shm
+*.incoming
+backups/
+
+# Khóa bí mật
+.streamlit/secrets.toml
+
+__pycache__/
+*.pyc
