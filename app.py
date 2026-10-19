@@ -1203,6 +1203,26 @@ def load_clients(active_only=False):
         return [dict(r) for r in db.execute(sql).fetchall()]
 
 
+def load_visible_clients(user, active_only=True):
+    """Khách hàng người dùng được phép thấy. Quản trị viên và người kiểm tra: tất cả.
+    Nhân viên: chỉ khách hàng mình phụ trách/kiểm tra theo cấu hình, hoặc đang có việc/vấn đề chưa xong được giao cho mình."""
+    clients = load_clients(active_only=active_only)
+    if is_privileged(user):
+        return clients
+    uid = user["id"]
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT id FROM clients WHERE staff_id=? OR reviewer_id=? "
+            "UNION SELECT client_id FROM tasks WHERE (assignee_id=? OR checker_id=?) "
+            "AND status NOT IN ('Đã hoàn thành','Không phát sinh') "
+            "UNION SELECT client_id FROM issues WHERE (handler_id=? OR checker_id=?) "
+            "AND ((kind='self' AND status<>'Đã chỉnh sửa') OR (kind='review' AND status<>'Đã sửa xong'))",
+            (uid, uid, uid, uid, uid, uid),
+        ).fetchall()
+    allowed = {r[0] for r in rows}
+    return [c for c in clients if c["id"] in allowed]
+
+
 def client_label(c):
     return f"{c['code']} - {c['name']}"
 
@@ -2785,10 +2805,13 @@ def page_dashboard(user):
 # TRANG: CÔNG VIỆC HÀNG THÁNG
 # ----------------------------------------------------------------------------
 def page_tasks(user, selected_client_id=None):
-    clients = load_clients(active_only=True)
+    clients = load_visible_clients(user, active_only=True)
     if not clients:
         st.header("✅ Công việc kế toán dịch vụ hàng tháng")
-        st.info("Chưa có khách hàng nào đang hoạt động. Quản trị viên vui lòng thêm khách hàng ở mục 'Khách hàng'.")
+        if is_privileged(user):
+            st.info("Chưa có khách hàng nào đang hoạt động. Quản trị viên vui lòng thêm khách hàng ở mục 'Khách hàng'.")
+        else:
+            st.info("Bạn chưa được giao khách hàng nào. Vui lòng liên hệ quản trị viên để được phân công.")
         return
 
     cmap = {c["id"]: c for c in clients}
@@ -3477,7 +3500,7 @@ def main():
         auto_generate_recent(user["username"])
         st.session_state["auto_generated"] = True
 
-    clients = load_clients(active_only=True)
+    clients = load_visible_clients(user, active_only=True)
     alerts = alert_rows(user)
     n_late = sum(1 for r in alerts if deadline_info(r["due_date"], r["status"])[1] == "late")
     n_soon = len(alerts) - n_late
