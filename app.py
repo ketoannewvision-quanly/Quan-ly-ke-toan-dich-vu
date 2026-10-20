@@ -2932,6 +2932,45 @@ def generate_client_from_start(client_id, actor, max_months=60):
     return total
 
 
+# Điều kiện "việc còn trống": chưa ai cập nhật bất kỳ ô nào
+UNTOUCHED_TASK_SQL = (
+    "status='Chưa thực hiện' "
+    "AND COALESCE(note,'')='' AND COALESCE(completed_date,'')='' AND tax_amount IS NULL "
+    "AND paid_amount IS NULL AND COALESCE(check_note,'')='' "
+    "AND COALESCE(check_status,'Chưa kiểm tra')='Chưa kiểm tra' AND COALESCE(receipt_no,'')='' "
+    "AND COALESCE(paid_date,'')='' AND COALESCE(archive_loc,'')='' "
+    "AND COALESCE(file_status,'Chưa nộp')='Chưa nộp'"
+)
+
+
+def purge_stale_tax_tasks(client_id):
+    """Sau khi đổi cấu hình sắc thuế (ví dụ GTGT từ Tháng sang Quý): xóa các việc B2/B3/B7-tờ khai
+    còn trống thuộc kỳ kê khai KHÔNG còn trong cấu hình. Việc đã có dữ liệu được giữ lại.
+    Trả về (số việc đã xóa, số việc lệch cấu hình nhưng đã có dữ liệu nên giữ lại)."""
+    with get_db() as db:
+        cfg = {(r["tax_type"], r["frequency"]) for r in db.execute(
+            "SELECT tax_type, frequency FROM client_taxes WHERE client_id=?", (client_id,)).fetchall()}
+        rows = db.execute(
+            "SELECT id, tax_type, tax_period, (" + UNTOUCHED_TASK_SQL + ") AS untouched FROM tasks "
+            "WHERE client_id=? AND tax_type<>'' AND (step IN ('B2','B3') "
+            "OR (step='B7' AND sub_item LIKE 'Tờ khai thuế %'))",
+            (client_id,),
+        ).fetchall()
+        stale_ids, kept = [], 0
+        for r in rows:
+            freq = (r["tax_period"] or "").split(" ")[0]  # "Tháng 05/2026" -> "Tháng"
+            if freq not in FREQUENCIES or (r["tax_type"], freq) in cfg:
+                continue
+            if r["untouched"]:
+                stale_ids.append(r["id"])
+            else:
+                kept += 1
+        for i in range(0, len(stale_ids), 500):
+            chunk = stale_ids[i:i + 500]
+            db.execute("DELETE FROM tasks WHERE id IN (%s)" % ",".join("?" * len(chunk)), chunk)
+    return len(stale_ids), kept
+
+
 def purge_untouched_before_start(client_id, start_period):
     """Xóa các việc còn trống (chưa ai cập nhật) của những kỳ trước tháng bắt đầu. Việc đã có dữ liệu được giữ lại."""
     with get_db() as db:
@@ -3146,9 +3185,16 @@ def page_clients(user):
                     "INSERT INTO client_taxes (client_id, tax_type, frequency) VALUES (?,?,?)",
                     (sel, tt, fq),
                 )
-        log_action(user["username"], "SUA_SAC_THUE", f"{c['code']}: {len(pairs)} dòng")
+        n_del, n_kept = purge_stale_tax_tasks(sel)
+        log_action(user["username"], "SUA_SAC_THUE",
+                   f"{c['code']}: {len(pairs)} dòng; xóa {n_del} việc sai kỳ kê khai, giữ {n_kept} việc đã có dữ liệu")
         n_new = generate_client_from_start(sel, user["username"]) if c["active"] else 0
-        flash("success", f"Đã lưu cấu hình sắc thuế; giao thêm {n_new} đầu việc (từ tháng bắt đầu đến hiện tại).")
+        msg = (f"Đã lưu cấu hình sắc thuế; giao thêm {n_new} đầu việc (từ tháng bắt đầu đến hiện tại); "
+               f"xóa {n_del} việc còn trống không đúng kỳ kê khai mới.")
+        if n_kept:
+            msg += (f" Còn {n_kept} việc theo kỳ kê khai cũ đã có dữ liệu nên được giữ lại — "
+                    "vui lòng kiểm tra và xóa/chuyển thủ công nếu không cần.")
+        flash("success", msg)
         bump_ver()
         st.rerun()
 
